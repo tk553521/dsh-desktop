@@ -1,0 +1,17 @@
+node_modules/
+target/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/resources/
+dist/fonts/
+app-icon.png
+shots/
+build-errors.log
+release-build.log
+*.log
+
+# 调试 / 会话修复临时文件
+session-*.jsonl.zstd
+session-*-removed-rows.jsonl
+session-*-repaired.jsonl.zstd
+tmp-*.mjs

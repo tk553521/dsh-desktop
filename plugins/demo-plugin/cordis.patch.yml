@@ -1,0 +1,5 @@
+# Demo bundle patch — one row inserted into the plugin tree.
+# Composed after every earlier layer; `id` is how later layers override this row.
+- insert:
+    - id: demo-plugin
+      name: '@dsh-desktop/demo-plugin'

@@ -1,0 +1,37 @@
+{
+  "identifier": "desktop",
+  "description": "DSH Desktop windows: the splash shell and the remote harness UI on fixed loopback ports.",
+  "windows": ["splash", "main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-title",
+    "core:event:default",
+    "allow-boot-state",
+    "allow-retry-boot",
+    "allow-reveal-logs",
+    "allow-plugin-list",
+    "allow-plugin-manage"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:3080/*",
+      "http://127.0.0.1:43210/*",
+      "http://127.0.0.1:43211/*",
+      "http://127.0.0.1:43212/*",
+      "http://localhost:3080/*",
+      "http://localhost:43210/*",
+      "http://localhost:43211/*",
+      "http://localhost:43212/*"
+    ]
+  }
+}
