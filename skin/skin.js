@@ -180,6 +180,94 @@ function startAurora(canvas) {
   });
 }
 
+// ---- window drag strip ------------------------------------------------------
+// The frameless window's whole top strip behaves like a native titlebar, not
+// just the floating pill: Tauri's core drag script walks data-tauri-drag-region
+// attributes — "deep" makes every non-interactive pixel of the region drag the
+// window, and double-click there toggles maximize, while buttons/links/inputs
+// inside the region stay fully clickable. The page header (center column) and
+// the sidebar brand row are the two containers that make up the top strip.
+// Re-applied on an interval because SPA routing swaps those elements.
+function wireDragStrip() {
+  const mark = (el) => {
+    if (el && el instanceof HTMLElement && !el.hasAttribute("data-tauri-drag-region")) {
+      el.setAttribute("data-tauri-drag-region", "deep");
+    }
+  };
+  const center = document.querySelector('[class*="_centerCol"]');
+  mark(center && center.querySelector("header"));
+  const sidebar = document.querySelector('[class*="_sidebarCol"]');
+  mark(sidebar && sidebar.querySelector('[class*="_logoRow" i]'));
+}
+
+// ---- welcome-notice (内测声明) rescue ---------------------------------------
+// When the harness's settings RPC fails (shared harness restarting, boot race,
+// connection drop), the 内测声明 dialog shows "暂时无法保存确认状态" and traps
+// the whole app: the client's OnboardingModal ignores dismiss (no close button,
+// Escape/backdrop are no-ops) and marks the app root `inert`, so the user is
+// frozen with no way out. Rescue: keep pressing the client's own 继续 button
+// (it knows the current acknowledgement version), and if the harness stays
+// unreachable, remove the dialog for the rest of the session so it can never
+// block the app again.
+(function wireWelcomeRescue() {
+  const ERROR_ZH = "暂时无法保存确认状态";
+  const ERROR_EN = "could not be saved";
+  const MAX_ATTEMPTS = 10;
+  let active = null; // { dialog, timer, attempts }
+
+  function dismiss() {
+    if (!active) return;
+    clearInterval(active.timer);
+    window.__dshWelcomeDismissed = true;
+    active.dialog.remove();
+    active = null;
+  }
+
+  function clickContinue() {
+    if (!active) return;
+    if (!active.dialog.isConnected) {
+      // the client unmounted it (acknowledged or re-rendered away) — stop
+      clearInterval(active.timer);
+      active = null;
+      return;
+    }
+    const button = [...active.dialog.querySelectorAll("button")].find((b) => {
+      const label = (b.textContent || "").trim();
+      return label === "继续" || label === "Continue";
+    });
+    if (button && !button.disabled) {
+      active.attempts += 1;
+      button.click();
+      if (active.attempts >= MAX_ATTEMPTS) dismiss();
+    }
+  }
+
+  function scan() {
+    const dialog = [...document.querySelectorAll('[role="dialog"]')].find((d) => {
+      const text = d.innerText || "";
+      return (
+        (text.includes("内测声明") || text.includes("Internal Testing Notice")) &&
+        (text.includes(ERROR_ZH) || text.includes(ERROR_EN))
+      );
+    });
+    if (!dialog) return;
+    if (window.__dshWelcomeDismissed) {
+      // user already dismissed this session — never trap them again
+      dialog.remove();
+      return;
+    }
+    if (active && active.dialog.isConnected) return; // already handling one
+    if (active) {
+      clearInterval(active.timer);
+      active = null;
+    }
+    active = { dialog, timer: setInterval(clickContinue, 1200), attempts: 0 };
+    clickContinue();
+  }
+
+  setInterval(scan, 800);
+})();
+
 // ---- titlebar -------------------------------------------------------------
 function buildTitlebar() {
   if (!document.body) return;
@@ -225,7 +313,11 @@ function buildTitlebar() {
     childList: true,
     characterData: true,
   });
-  setInterval(updateTitle, 1500);
+  wireDragStrip();
+  setInterval(() => {
+    updateTitle();
+    wireDragStrip();
+  }, 1500);
 
   let win = null;
   const wire = () => {

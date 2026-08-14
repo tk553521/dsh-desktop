@@ -141,6 +141,52 @@ fn tcp_free(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
+/// POST a minimal settings.describe RPC and report whether the settings
+/// service answered ok. The harness's HTTP server binds before its plugin
+/// tree (settings included) is fully up, so a page loaded in that window
+/// hits failing RPCs — which leaves the 内测声明 dialog stuck. This probe
+/// gates the main window on the settings service actually being ready.
+fn settings_ready(port: u16) -> bool {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let body = r#"{"type":"client-request","rpcId":"dsh-desktop-readiness","method":"settings.describe","payload":{}}"#;
+    let request = format!(
+        "POST /api/settings.describe HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 64 * 1024 {
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.contains("\"ok\":true") || text.contains("\"ok\": true")
+}
+
+/// Wait up to `timeout` for the harness settings service on `port` to answer
+/// settings.describe successfully. Best effort: returns regardless.
+fn wait_settings_ready(port: u16, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !settings_ready(port) && Instant::now() < deadline {
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
 /// Pick the port the harness should run on: reuse a live DSH when present,
 /// otherwise the first fixed port that is free, otherwise any free port.
 /// `DSH_DESKTOP_FORCE_PORT` (testing hook) skips probing and forces a spawn.
@@ -404,6 +450,10 @@ fn boot_flow(app: AppHandle, state: AppState, generation: u64) {
 
     if reuse_body.is_some() {
         set("reuse", &format!("harness already live on 127.0.0.1:{port}"), None, Some(url.clone()), None);
+        // The server may still be composing its plugin tree; a page loaded
+        // now would hit failing settings RPCs (stuck 内测声明 dialog). Wait
+        // briefly for the settings service before opening the window.
+        wait_settings_ready(port, Duration::from_secs(6));
         let _ = open_main_window(&app, url);
         return;
     }
@@ -446,6 +496,9 @@ fn boot_flow(app: AppHandle, state: AppState, generation: u64) {
         } else if let Some(body) = probe_dsh(port) {
             let _ = body;
             set("serve", "serving the harness UI", None, Some(url.clone()), None);
+            // Same readiness gate as the reuse path: never open the window
+            // against a half-initialized settings service.
+            wait_settings_ready(port, Duration::from_secs(6));
             let _ = open_main_window(&app, url);
             return;
         }
