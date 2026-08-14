@@ -19,6 +19,7 @@
     "allow-boot-state",
     "allow-retry-boot",
     "allow-reveal-logs",
+    "allow-stage-attachments",
     "allow-plugin-list",
     "allow-plugin-manage"
   ],

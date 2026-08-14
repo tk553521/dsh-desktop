@@ -560,6 +560,98 @@ fn reveal_logs(app: AppHandle) {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct StagedAttachment {
+    /// 用户拖入的原始路径
+    original: String,
+    /// 复制后的绝对路径（供 agent 的 read 工具读取）
+    path: String,
+    /// 文件名/目录名（不含父目录）
+    name: String,
+    /// "file" | "directory"
+    kind: String,
+}
+
+/// 生成不冲突的目标路径：foo.txt → foo.txt / foo-1.txt / foo-2.txt …
+fn unique_destination(dir: &std::path::Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1.. {
+        let candidate = dir.join(format!("{stem}-{n}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// 递归复制目录（跳过符号链接等非常规文件）。
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// 把拖入的本地文件/目录复制到 `~/.dsh/attachments/`，返回落盘绝对路径。
+/// 路径列表通常来自 Tauri 的 `tauri://drag-drop` 事件。
+#[tauri::command]
+fn stage_attachments(paths: Vec<String>) -> Result<Vec<StagedAttachment>, String> {
+    let dir = resolve_dsh_home().join("attachments");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("create attachments dir: {error}"))?;
+
+    let mut staged = Vec::new();
+    for raw in paths {
+        let src = PathBuf::from(&raw);
+        if !src.exists() {
+            continue;
+        }
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "attachment".to_string());
+        let dst = unique_destination(&dir, &name);
+        if src.is_dir() {
+            copy_dir_recursive(&src, &dst).map_err(|error| format!("copy dir {raw}: {error}"))?;
+            staged.push(StagedAttachment {
+                original: raw,
+                path: clean_path(&dst).display().to_string(),
+                name,
+                kind: "directory".to_string(),
+            });
+        } else if src.is_file() {
+            std::fs::copy(&src, &dst).map_err(|error| format!("copy {raw}: {error}"))?;
+            staged.push(StagedAttachment {
+                original: raw,
+                path: clean_path(&dst).display().to_string(),
+                name,
+                kind: "file".to_string(),
+            });
+        }
+    }
+    Ok(staged)
+}
+
 // ---------------------------------------------------------------------------
 // plugin management (the exe speaks the same `dsh plugin` pnpm protocol)
 // ---------------------------------------------------------------------------
@@ -690,7 +782,7 @@ pub fn run() {
             show_main(app);
         }))
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![boot_state, retry_boot, reveal_logs, plugin_list, plugin_manage])
+        .invoke_handler(tauri::generate_handler![boot_state, retry_boot, reveal_logs, stage_attachments, plugin_list, plugin_manage])
         .setup(|app| {
             let handle = app.handle().clone();
             build_tray(&handle)?;

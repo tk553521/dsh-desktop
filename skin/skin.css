@@ -333,8 +333,9 @@ a:hover {
   display: grid;
   place-items: center;
   border-radius: 7px;
-  background: conic-gradient(from 210deg, #2fb2f2, #7a63ff 42%, #e6339a 78%, #2fb2f2);
-  box-shadow: 0 0 14px rgba(122, 99, 255, 0.45);
+  background: #ffffff;
+  box-shadow: 0 0 12px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(0, 0, 0, 0.06);
+  color: #000000;
 }
 
 #dsh-titlebar .dsh-tb-word {
@@ -822,4 +823,111 @@ textarea:focus, input:focus {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ---------- drop overlay：只蒙住输入框 ---------- */
+
+#dsh-drop-overlay {
+  position: fixed;
+  z-index: 2147483002;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  border-radius: 22px;
+  background: rgba(12, 14, 23, 0.62);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  animation: dsh-drop-in 0.16s ease;
+}
+#dsh-drop-overlay.dsh-hidden { display: none; }
+
+@keyframes dsh-drop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.dsh-drop-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 28px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(24, 27, 43, 0.95), rgba(12, 14, 23, 0.92));
+  border: 1.5px dashed rgba(139, 118, 255, 0.55);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  color: rgb(233, 234, 244);
+  font-family: var(--dsh-font);
+}
+.dsh-drop-icon { color: var(--dsw-static-deepseek-400, #9e8dff); }
+.dsh-drop-title {
+  font-size: 14px;
+  font-weight: 640;
+  letter-spacing: 0.02em;
+}
+
+/* ---------- attachment rail：输入框上方的附件控件 ---------- */
+
+#dsh-attach-rail {
+  position: fixed;
+  z-index: 2147483001;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 14px;
+  background: rgba(12, 14, 23, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  font-family: var(--dsh-font);
+}
+#dsh-attach-rail.dsh-hidden { display: none; }
+
+.dsh-attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 8px;
+  max-width: 280px;
+  border-radius: 9px;
+  background: linear-gradient(120deg, rgba(139, 118, 255, 0.16), rgba(47, 178, 242, 0.12));
+  border: 1px solid rgba(139, 118, 255, 0.38);
+  color: rgb(233, 234, 244);
+  font-size: 12px;
+  line-height: 1.4;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.dsh-attach-chip .dsh-attach-ico {
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: rgb(199, 240, 254);
+}
+.dsh-attach-chip .dsh-attach-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+.dsh-attach-chip .dsh-attach-x {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: rgb(165, 170, 198);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.dsh-attach-chip .dsh-attach-x:hover {
+  background: rgba(240, 82, 82, 0.2);
+  color: rgb(248, 113, 113);
 }

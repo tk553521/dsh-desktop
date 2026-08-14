@@ -4,6 +4,11 @@ DeepSeek Harness（DSH）的 **Tauri 桌面版** —— 把完整的浏览器代
 
 > **免责声明**：本项目是**个人使用**的第三方封装，**与 DeepSeek 官方无关**，未获得 DeepSeek 官方授权、背书或支持。「DeepSeek」及相关标识归其权利方所有。本项目仅是对 `@deepseek-ai/dsh` 运行时的本地打包与界面封装。
 
+## 图标
+
+- **应用图标（exe / 快捷方式）**：DeepSeek 鲸鱼娘图标，来自 [fornarwhal/deepseek-whale-girl-icon](https://github.com/fornarwhal/deepseek-whale-girl-icon)，许可证 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)（署名—非商业性使用—相同方式共享）。
+- **界面标记（标题栏 / 启动画面）**：黑色鲸鱼，轮廓取自 DeepSeek 官方 favicon。
+
 ## 许可证
 
 本项目采用 [MIT License](./LICENSE) 开源许可。

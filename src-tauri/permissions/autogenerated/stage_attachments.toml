@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stage-attachments"
+description = "Enables the stage_attachments command without any pre-configured scope."
+commands.allow = ["stage_attachments"]
+
+[[permission]]
+identifier = "deny-stage-attachments"
+description = "Denies the stage_attachments command without any pre-configured scope."
+commands.deny = ["stage_attachments"]
