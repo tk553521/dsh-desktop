@@ -15,9 +15,11 @@ dist/index.html           启动画面（WebGL 极光、动态文字）
 src-tauri/                Tauri 外壳
   src/lib.rs              启动流程：spawn/复用 `dsh web`、托盘、窗口
   scripts/init.js         生成的皮肤注入 bundle（见下文）
-  resources/runtime/      内置运行时（生成产物，不入库）：
-    node.exe              固定版本 Node.js v25.2.1（与原生插件 ABI 匹配）
-    node_modules/         固定版本 @deepseek-ai/dsh 依赖树（即 Harness 本体）
+  resources/runtime/      内置运行时（清单入库，产物生成，见下文）：
+    package.json          提交的依赖清单（@deepseek-ai/dsh@0.1.0-rc.6）
+    package-lock.json     提交的锁定文件（确定性 npm ci 的依据）
+    node.exe              由 scripts/prepare-runtime.mjs 复制构建机 node
+    node_modules/         由 `npm ci` 生成（不入库）
   icons/                  应用图标集
 skin/
   skin.css                完整的 --dsw-* token 重映射 + 字体 + 窗口样式
@@ -57,18 +59,27 @@ Harness 界面通过 `--dsw-static-*` / `--dsw-alias-*` CSS 变量做了完整�
 
 ## 构建
 
+干净机器上只需两步（`npm run tauri` 会自动触发 `pretauri` 准备内置运行时，无需任何手动复制）：
+
 ```powershell
 npm install
-node scripts/fetch-fonts.mjs     # 首次执行一次；下载 woff2 字体
-node scripts/build-skin.mjs      # 重新生成 src-tauri/scripts/init.js
-npx tauri icon app-icon.png      # 首次执行一次；生成图标集（需要 app-icon.png）
-npx tauri build                  # release + NSIS 安装包（target/release/bundle）
+npm run tauri build            # release + NSIS 安装包（target/release/bundle）
 ```
 
-首次构建需要从零编译 Tauri（耗时数分钟）。debug 构建会把 WebView2 暴露在 `http://127.0.0.1:9333/json` 供 CDP 调试：
+`npm run tauri build` 时，`pretauri`（`scripts/prepare-runtime.mjs`）会自动：
+
+1. 把提交的 `skin/fonts/*.woff2` 同步到 `dist/fonts/`（启动画面字体）；
+2. 复制构建机当前 `node.exe` 到 `src-tauri/resources/runtime/node.exe`；
+3. 用提交的 `package-lock.json` 执行 `npm ci`，生成 `node_modules`（原生插件均为 N-API/预编译，与 Node 版本解耦，无需本地编译器）；
+4. 从 npm registry 拉取独立版 `pnpm.exe`（插件面板用，离线时跳过并仅影响插件安装）。
+
+首次构建需从零下载约 255 MB 依赖并编译 Tauri（耗时数分钟）；之后增量构建会自动跳过已就绪的运行时。原生字体（`skin/fonts`）与图标集均已入库，`scripts/fetch-fonts.mjs`、`npx tauri icon` 只在**改动**皮肤字体/图标后才需要重跑。
+
+debug 构建会把 WebView2 暴露在 `http://127.0.0.1:9333/json` 供 CDP 调试：
 `pwsh scripts/cdp.ps1 -Eval "document.title"`。
 
 ## 运行时布局说明
 
-- 内置 `node_modules` 是正在运行的 `@deepseek-ai/dsh@0.1.0-rc.6` 安装的逐字节拷贝，因此原生插件（sharp、node-pty、ripgrep）与内置 Node ABI 完全匹配。
-- `resources/runtime/` 是生成产物（见 `.gitignore`）；用 robocopy 复制 Harness 依赖树加上匹配的 `node.exe` 即可补齐。
+- `resources/runtime/package.json` + `package-lock.json` 是**提交的清单**，`node_modules` 由 `npm ci` 按锁定文件确定性生成（integrity 校验），等价于逐字节复刻一份已知可用的 `@deepseek-ai/dsh@0.1.0-rc.6` 安装。
+- 内置 `node.exe` 即构建机 node：它既用来跑 `npm ci`，也随应用打包，因此原生插件（sharp、node-pty、ripgrep 等，均为 N-API/预编译/独立 exe）ABI 必然匹配。若想固定版本，可自行把某个 node.exe 放到 `resources/runtime/`（脚本发现已存在则跳过复制）。
+- `node_modules/`、`node.exe`、`tools/` 为生成产物（见 `.gitignore`）。

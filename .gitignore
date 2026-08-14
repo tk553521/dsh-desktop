@@ -2,8 +2,13 @@ node_modules/
 target/
 src-tauri/target/
 src-tauri/gen/
-src-tauri/resources/
+# 内置运行时是生成产物；但 package.json / package-lock.json 是提交的清单（脚本据此 npm ci）
+src-tauri/resources/runtime/node_modules/
+src-tauri/resources/runtime/node.exe
+src-tauri/resources/runtime/.prepared
+src-tauri/resources/tools/
 dist/fonts/
+.tmp-pnpm/
 app-icon.png
 shots/
 build-errors.log

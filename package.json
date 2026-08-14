@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "pretauri": "node scripts/prepare-runtime.mjs",
     "tauri": "tauri",
     "icon": "tauri icon"
   },
