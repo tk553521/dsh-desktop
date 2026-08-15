@@ -10,6 +10,7 @@ fn main() {
                 "stage_attachments",
                 "plugin_list",
                 "plugin_manage",
+                "plugin_set_enabled",
             ]),
         ),
     )

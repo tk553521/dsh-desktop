@@ -383,12 +383,12 @@ function buildPluginPanel() {
   panel.innerHTML = `
     <div class="dsp-head">
       <span class="dsp-title">${lucide("puzzle", 13)} <b>Plugins</b></span>
-      <span class="dsp-headnote">cordis</span>
+      <span class="dsp-headnote">cordis · hot-swap</span>
       <button class="dsh-tb-btn dsp-close" title="Close" aria-label="Close">${lucide("close")}</button>
     </div>
     <div class="dsp-status" id="dsp-status"></div>
     <div class="dsp-install">
-      <input id="dsp-input" spellcheck="false" placeholder="package spec — name / file: / git+" />
+      <input id="dsp-input" spellcheck="false" placeholder="GitHub repo URL — https://github.com/owner/repo" />
       <button class="dsh-tb-btn dsp-add" title="Install" aria-label="Install">${lucide("plus")}</button>
     </div>
     <div class="dsp-list" id="dsp-list"></div>
@@ -412,6 +412,67 @@ function buildPluginPanel() {
     log.scrollTop = log.scrollHeight;
   };
 
+  const readClientGraph = async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    try {
+      const response = await fetch(`/?dsh-desktop-graph=${Date.now()}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) return null;
+      const text = await response.text();
+      const marker = "window.__DSH_BOOT__ = ";
+      const start = text.indexOf(marker);
+      if (start < 0) return null;
+      let payload = text.slice(start + marker.length);
+      const end = payload.indexOf("</script>");
+      if (end < 0) return null;
+      payload = payload.slice(0, end).trim().replace(/;+\s*$/, "");
+      const data = JSON.parse(payload);
+      return (data.entries || []).map((entry) => entry.id);
+    } catch (_) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // The host patch layer hot-swaps server plugins immediately, but a page
+  // that is already open keeps the old `window.__DSH_BOOT__` client graph.
+  // Wait until a fresh GET / reflects the change, then reload only the page
+  // (the harness process and all sessions stay alive).
+  const waitForClientGraph = async (name, enabled, timeoutMs = 30000) => {
+    const deadline = Date.now() + timeoutMs;
+    let announced = false;
+    while (Date.now() < deadline) {
+      const ids = await readClientGraph();
+      if (ids) {
+        const present = ids.includes(name);
+        if (present === enabled) {
+          logLine(`client graph ${enabled ? "contains" : "dropped"} ${name}`, "ok");
+          return true;
+        }
+      }
+      if (!announced) {
+        logLine(`waiting for the cordis host graph to ${enabled ? "add" : "drop"} ${name}…`, "warn");
+        announced = true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+    logLine(`timed out waiting for ${name} in the client graph`, "err");
+    return false;
+  };
+
+  const reloadClient = (names, enabled) =>
+    Promise.all(names.map((name) => waitForClientGraph(name, enabled))).then((results) => {
+      if (results.every(Boolean)) {
+        logLine("client graph updated — reloading the page", "ok");
+        setTimeout(() => window.location.reload(), 250);
+      }
+      return results.every(Boolean);
+    });
+
   const refresh = async () => {
     if (!invoke) {
       status.textContent = "tauri ipc unavailable";
@@ -429,44 +490,70 @@ function buildPluginPanel() {
       pnpmNote.textContent = data.pnpm ? "pnpm bundled" : "pnpm missing";
       status.appendChild(pnpmNote);
 
+      const addBtn = panel.querySelector(".dsp-add");
+      if (addBtn) addBtn.disabled = !data.pnpm;
+
       list.innerHTML = "";
       if (data.bundles.length) {
         const head = document.createElement("div");
         head.className = "dsp-section";
-        head.textContent = `layers · ${data.bundles.length}`;
+        head.textContent = `bundle layers · ${data.bundles.length}`;
         list.appendChild(head);
         for (const name of data.bundles) {
           const row = document.createElement("div");
           row.className = "dsp-row";
-          row.innerHTML = `<span class="dsp-row-name">${name}</span><span class="dsp-row-tag">bundle</span>`;
+          const label = document.createElement("span");
+          label.className = "dsp-row-name";
+          label.textContent = name;
+          const tag = document.createElement("span");
+          tag.className = "dsp-row-tag";
+          tag.textContent = "bundle";
+          row.appendChild(label);
+          row.appendChild(tag);
           list.appendChild(row);
         }
       }
       if (data.dependencies.length) {
         const head = document.createElement("div");
         head.className = "dsp-section";
-        head.textContent = `installed packages · ${data.dependencies.length}`;
+        head.textContent = `installed plugins · ${data.dependencies.length}`;
         list.appendChild(head);
         for (const dep of data.dependencies) {
           const row = document.createElement("div");
           row.className = "dsp-row";
           const label = document.createElement("span");
           label.className = "dsp-row-name";
-          label.textContent = `${dep.name} · ${dep.spec}`;
-          const btn = document.createElement("button");
-          btn.className = "dsh-tb-btn dsp-remove";
-          btn.title = "Remove";
-          btn.innerHTML = lucide("trash", 12);
-          btn.addEventListener("click", () => run("remove", dep.name));
+          label.textContent = `${dep.name} · ${typeof dep.spec === "string" ? dep.spec : JSON.stringify(dep.spec)}`;
+          label.title = label.textContent;
+          const actions = document.createElement("span");
+          actions.className = "dsp-actions";
+          const toggle = document.createElement("button");
+          toggle.type = "button";
+          toggle.className = "dsp-toggle" + (dep.enabled ? " dsp-toggle-on" : "");
+          toggle.setAttribute("role", "switch");
+          toggle.setAttribute("aria-checked", dep.enabled ? "true" : "false");
+          toggle.title = dep.enabled ? "Disable — unload immediately" : "Enable — load immediately";
+          toggle.innerHTML = `<span class="dsp-toggle-knob"></span>`;
+          toggle.addEventListener("click", () => setEnabled(dep.name, !dep.enabled));
+          if (!data.pnpm) toggle.disabled = true;
+          const remove = document.createElement("button");
+          remove.className = "dsh-tb-btn dsp-remove";
+          remove.title = "Remove";
+          remove.innerHTML = lucide("trash", 12);
+          remove.addEventListener("click", () => run("remove", dep.name));
+          if (!data.pnpm) remove.disabled = true;
+          actions.appendChild(toggle);
+          actions.appendChild(remove);
           row.appendChild(label);
-          row.appendChild(btn);
+          row.appendChild(actions);
           list.appendChild(row);
         }
-      }
-      if (!data.bundles.length && !data.dependencies.length) {
+      } else {
         const empty = document.createElement("div");
         empty.className = "dsp-empty";
-        empty.textContent = "no out-of-tree plugins installed";
+        empty.textContent = data.pnpm
+          ? "no out-of-tree plugins installed — paste a GitHub repo URL above"
+          : "pnpm is missing, so plugin install is unavailable";
         list.appendChild(empty);
       }
     } catch (error) {
@@ -474,22 +561,59 @@ function buildPluginPanel() {
     }
   };
 
-  const run = async (action, name) => {
-    if (!invoke) return;
-    logLine(`> ${action} ${name}`, "cmd");
-    input.disabled = true;
+  let pluginBusy = false;
+
+  const setEnabled = async (name, enabled) => {
+    if (!invoke || pluginBusy) return;
+    pluginBusy = true;
+    logLine(`> ${enabled ? "enable" : "disable"} ${name}`, "cmd");
     try {
-      const output = await invoke("plugin_manage", { action, name });
-      if (output.trim()) logLine(output.trim(), "out");
-      logLine(`${action} ${name} — done`, "ok");
-      if (action === "add") {
-        logLine("restart the harness to compose the new bundle layer", "warn");
+      const result = await invoke("plugin_set_enabled", { name, enabled });
+      const message = (result && result.message) || String(result || "");
+      if (message.trim()) logLine(message.trim(), "out");
+      logLine(`${name} ${enabled ? "enabled" : "disabled"} — hot-applied by cordis HMR`, "ok");
+      if (result && result.reload) {
+        const ready = await reloadClient([name], enabled);
+        if (!ready) await refresh();
+      } else {
+        await refresh();
       }
-      await refresh();
     } catch (error) {
       logLine(String(error), "err");
     } finally {
+      pluginBusy = false;
+    }
+  };
+
+  const run = async (action, name) => {
+    if (!invoke || pluginBusy) return;
+    pluginBusy = true;
+    logLine(`> ${action} ${name}`, "cmd");
+    input.disabled = true;
+    const addBtn = panel.querySelector(".dsp-add");
+    if (addBtn) addBtn.disabled = true;
+    try {
+      const result = await invoke("plugin_manage", { action, name });
+      const output = (result && result.output) || String(result || "");
+      if (output.trim()) logLine(output.trim(), "out");
+      logLine(`${action} ${name} — done`, "ok");
+      if (action === "add") {
+        logLine("hot-loaded through cordis HMR — no restart needed", "warn");
+        input.value = "";
+      }
+      if (result && result.reload && Array.isArray(result.clients) && result.clients.length) {
+        const ready = await reloadClient(result.clients, action === "add");
+        if (!ready) await refresh();
+      } else {
+        await refresh();
+      }
+    } catch (error) {
+      logLine(String(error), "err");
+      await refresh();
+    } finally {
+      pluginBusy = false;
       input.disabled = false;
+      if (addBtn) addBtn.disabled = false;
     }
   };
 

@@ -7,8 +7,9 @@
 //! at the harness UI. Closing the main window hides it to the tray; quitting
 //! from the tray tears the child process tree down.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
@@ -437,6 +438,23 @@ fn boot_flow(app: AppHandle, state: AppState, generation: u64) {
         return;
     }
     let dsh_home = resolve_dsh_home();
+
+    // Bring the DSH Desktop hot-swap patch layer forward to this harness
+    // generation *before* the process composes its tree. After a restart,
+    // plugins previously supplied by the old boot bundle snapshot must be
+    // written back as full hot-layer rows, otherwise they would be missing
+    // until the plugin panel happened to refresh.
+    if let Some((_, manifest)) = read_profile_manifest(&dsh_home) {
+        let profile = profile_dir(&dsh_home);
+        let bundles = manifest_bundle_names(&manifest);
+        let mut plugin_state = load_plugin_state(&profile);
+        if let Err(error) =
+            refresh_plugin_state_generation(&profile, &mut plugin_state, generation, &bundles)
+        {
+            eprintln!("dsh-desktop: plugin hot-swap state migration failed: {error}");
+        }
+    }
+
     let log_path = match app.path().app_log_dir() {
         Ok(dir) => {
             let _ = std::fs::create_dir_all(&dir);
@@ -709,77 +727,626 @@ fn stage_attachments(paths: Vec<String>) -> Result<Vec<StagedAttachment>, String
 // plugin management (the exe speaks the same `dsh plugin` pnpm protocol)
 // ---------------------------------------------------------------------------
 
+const PLUGIN_PROFILE: &str = "web";
+const PLUGIN_STATE_FILENAME: &str = ".dsh-desktop-plugins.json";
+const PATCH_MANAGED_BEGIN: &str =
+    "# BEGIN DSH_DESKTOP_PLUGINS — managed by DSH Desktop; edits between the markers are overwritten.";
+const PATCH_MANAGED_END: &str = "# END DSH_DESKTOP_PLUGINS";
+const PLUGIN_BLOCK_MARKER: &str = "# dsh-desktop:plugin ";
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PluginSwitchEntry {
+    name: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    /// `boot-bundle`: the running harness already composes this package from
+    /// the boot-time bundle snapshot, so the hot layer only needs
+    /// `disabled` overrides. `hot-layer`: the hot patch layer owns the full
+    /// row set (used for plugins installed during this harness run and for
+    /// every managed plugin after the next harness restart).
+    #[serde(default = "default_origin")]
+    origin: String,
+    /// The patch rows this package contributes when it is enabled. These are
+    /// either the package's own `dsh.bundle.patch` list, an existing user
+    /// patch row discovered in cordis.patch.yml, or a generated row.
+    rows: Vec<serde_json::Value>,
+    /// Set when rows came from the package manifest (informational).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle_patch: Option<String>,
+    /// Original YAML text of the bundle patch. Preserved verbatim so custom
+    /// YAML tags such as `!!js` survive the hot layer round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patch_text: Option<String>,
+    /// True when the package contributes a browser half (`dsh.client` or an
+    /// `exports["./client"]` entry). The webview needs a page reload after a
+    /// host-side hot swap so the new client graph is actually injected.
+    #[serde(default)]
+    client: bool,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct PluginSwitchState {
+    #[serde(default = "plugin_state_version")]
+    version: u32,
+    /// AppState generation of the harness run this state was authored for.
+    /// When it differs, the harness has restarted and `boot-bundle` entries
+    /// can safely become `hot-layer` entries (the synced manifest no longer
+    /// puts them in the boot bundle snapshot).
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    plugins: BTreeMap<String, PluginSwitchEntry>,
+}
+
+fn plugin_state_version() -> u32 {
+    3
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_origin() -> String {
+    "hot-layer".to_string()
+}
+
+fn current_harness_generation(app_state: &tauri::State<'_, AppState>) -> u64 {
+    app_state
+        .generation
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or(0)
+}
+
+/// After a harness restart the boot bundle snapshot no longer contains
+/// state-managed packages (they were removed from `dsh.profile.bundles`), so
+/// the hot patch layer must contribute their full row set again.
+fn refresh_plugin_state_generation(
+    profile: &PathBuf,
+    state: &mut PluginSwitchState,
+    generation: u64,
+    manifest_bundles: &[String],
+) -> Result<bool, String> {
+    if state.generation == generation {
+        return Ok(false);
+    }
+    // The harness restarted. A package that is still in the fresh boot
+    // bundle list keeps using override-only patches; every other managed
+    // package must now contribute its full rows from the hot layer.
+    for entry in state.plugins.values_mut() {
+        entry.origin = if manifest_bundles
+            .iter()
+            .any(|bundle| bundle == &entry.name)
+        {
+            "boot-bundle".to_string()
+        } else {
+            "hot-layer".to_string()
+        };
+    }
+    state.generation = generation;
+    if !state.plugins.is_empty() {
+        write_managed_patch(profile, state)?;
+    }
+    save_plugin_state(profile, state)?;
+    Ok(true)
+}
+
+#[derive(serde::Serialize)]
+struct PluginDependency {
+    name: String,
+    spec: serde_json::Value,
+    enabled: bool,
+    managed: bool,
+    client: bool,
+}
+
 #[derive(serde::Serialize)]
 struct PluginList {
     home: String,
     profile: String,
     bundles: Vec<String>,
-    dependencies: Vec<serde_json::Value>,
+    dependencies: Vec<PluginDependency>,
     pnpm: bool,
 }
 
+#[derive(serde::Serialize)]
+struct PluginToggleResult {
+    message: String,
+    reload: bool,
+}
+
+#[derive(serde::Serialize)]
+struct PluginManageResult {
+    output: String,
+    reload: bool,
+    /// Package names whose browser half changed; the webview reloads after
+    /// the host graph has caught up so the new client graph is injected.
+    clients: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// small file helpers (atomic writes keep the HMR watcher from seeing halves)
+// ---------------------------------------------------------------------------
+
+fn profile_dir(home: &PathBuf) -> PathBuf {
+    home.join("profiles").join(PLUGIN_PROFILE)
+}
+
+fn profile_manifest_path(profile: &PathBuf) -> PathBuf {
+    profile.join("package.json")
+}
+
+fn profile_patch_path(profile: &PathBuf) -> PathBuf {
+    profile.join("cordis.patch.yml")
+}
+
+fn plugin_state_path(profile: &PathBuf) -> PathBuf {
+    profile.join(PLUGIN_STATE_FILENAME)
+}
+
 fn read_profile_manifest(home: &PathBuf) -> Option<(String, serde_json::Value)> {
-    let path = home.join("profiles").join("web").join("package.json");
+    let profile = profile_dir(home);
+    let path = profile_manifest_path(&profile);
     let raw = std::fs::read_to_string(&path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some((path.display().to_string(), value))
 }
 
-#[tauri::command]
-fn plugin_list(app: AppHandle) -> PluginList {
-    let home = resolve_dsh_home();
-    let (profile, manifest) = read_profile_manifest(&home).unwrap_or_else(|| {
-        (
-            home.join("profiles")
-                .join("web")
-                .join("package.json")
-                .display()
-                .to_string(),
-            serde_json::json!({}),
-        )
-    });
-    let bundles = manifest
-        .pointer("/dsh/profile/bundles")
-        .and_then(|v| v.as_array())
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let dependencies = manifest
-        .pointer("/dependencies")
-        .and_then(|v| v.as_object())
-        .map(|deps| {
-            deps.iter()
-                .map(|(k, v)| serde_json::json!({ "name": k, "spec": v }))
-                .collect()
-        })
-        .unwrap_or_default();
-    let pnpm = tools_dir(&app)
-        .map(|dir| dir.join("pnpm.exe").exists() || dir.join("pnpm").join("pnpm.exe").exists())
-        .unwrap_or(false);
-    PluginList {
-        home: home.display().to_string(),
-        profile,
-        bundles,
-        dependencies,
-        pnpm,
+fn read_json(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+fn write_atomic(path: &std::path::Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dsh-desktop-tmp".to_string());
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.dsh-desktop-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, content).map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    if let Err(rename_error) = std::fs::rename(&tmp, path) {
+        // Windows fallback: some filesystems refuse replacing an existing file
+        // through rename, even though Rust normally uses MOVEFILE_REPLACE_EXISTING.
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp, path)
+            .map_err(|error| format!("replace {} after {rename_error}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn write_json(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
+    let mut text = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    text.push('\n');
+    write_atomic(path, &text)
+}
+
+fn load_plugin_state(profile: &PathBuf) -> PluginSwitchState {
+    let path = plugin_state_path(profile);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        let state = PluginSwitchState::default();
+        return PluginSwitchState {
+            version: plugin_state_version(),
+            ..state
+        };
+    };
+    let mut state: PluginSwitchState = serde_json::from_str(&raw).unwrap_or_default();
+    state.version = plugin_state_version();
+    state
+}
+
+fn save_plugin_state(profile: &PathBuf, state: &PluginSwitchState) -> Result<(), String> {
+    let value = serde_json::to_value(state).map_err(|error| error.to_string())?;
+    write_json(&plugin_state_path(profile), &value)
+}
+
+fn parse_yaml_to_json_array(text: &str) -> Result<Vec<serde_json::Value>, String> {
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|error| format!("parse YAML: {error}"))?;
+    let sequence = parsed
+        .as_sequence()
+        .ok_or_else(|| "YAML patch must be a top-level list".to_string())?;
+    sequence
+        .iter()
+        .map(|item| serde_json::to_value(item).map_err(|error| error.to_string()))
+        .collect()
+}
+
+fn yaml_rows_string(rows: &[serde_json::Value]) -> Result<String, String> {
+    serde_yaml::to_string(&rows).map_err(|error| format!("serialize YAML: {error}"))
+}
+
+// ---------------------------------------------------------------------------
+// patch-row discovery / hot-swap patch generation
+// ---------------------------------------------------------------------------
+
+fn package_dir(profile: &PathBuf, package_name: &str) -> Option<PathBuf> {
+    let candidate = profile.join("node_modules").join(package_name);
+    if candidate.join("package.json").exists() {
+        return Some(candidate);
+    }
+    // pnpm's hoisted layout usually places scoped packages exactly at
+    // node_modules/@scope/name; the candidate above already covers that.
+    None
+}
+
+fn bundle_patch_rows(
+    package_dir: &PathBuf,
+    package: &serde_json::Value,
+) -> Result<Option<(Vec<serde_json::Value>, String)>, String> {
+    let Some(patch_rel) = package
+        .pointer("/dsh/bundle/patch")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(None);
+    };
+    let patch_path = package_dir.join(patch_rel);
+    let text = std::fs::read_to_string(&patch_path)
+        .map_err(|error| format!("read bundle patch {}: {error}", patch_path.display()))?;
+    Ok(Some((parse_yaml_to_json_array(&text)?, text)))
+}
+
+/// Find every row object in a patch tree whose `name` equals `package_name`.
+fn collect_rows_by_name(
+    value: &serde_json::Value,
+    package_name: &str,
+    out: &mut Vec<serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_rows_by_name(item, package_name, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.get("name").and_then(|name| name.as_str()) == Some(package_name) {
+                out.push(value.clone());
+            }
+            for child in map.values() {
+                collect_rows_by_name(child, package_name, out);
+            }
+        }
+        _ => {}
     }
 }
 
-/// Forward a `dsh plugin` operation to pnpm through the bundled runtime:
-/// action is `add` or `remove`, `name` is any pnpm spec (name, file:, link:,
-/// git+, ...). Runs `node bin.js plugin --profile web <action> <name>`.
-#[tauri::command]
-fn plugin_manage(app: AppHandle, action: String, name: String) -> Result<String, String> {
-    if action != "add" && action != "remove" {
-        return Err(format!("unknown plugin action {action:?}"));
+fn read_user_patch_rows(profile: &PathBuf) -> Vec<serde_json::Value> {
+    let path = profile_patch_path(profile);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    parse_yaml_to_json_array(&text).unwrap_or_default()
+}
+
+fn slug_id(name: &str) -> String {
+    let tail = name.rsplit('/').next().unwrap_or(name);
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for ch in tail.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            if ch == '-' && previous_dash {
+                continue;
+            }
+            slug.push(ch.to_ascii_lowercase());
+            previous_dash = ch == '-';
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
     }
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("plugin spec is empty".to_string());
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "plugin".to_string()
+    } else {
+        format!("dsh-desktop-{slug}")
     }
+}
+
+fn package_has_client(package: &serde_json::Value) -> bool {
+    if package.pointer("/dsh/client").is_some() {
+        return true;
+    }
+    package
+        .get("exports")
+        .and_then(|exports| exports.get("./client"))
+        .is_some()
+}
+
+fn build_switch_entry(
+    profile: &PathBuf,
+    package_name: &str,
+    patch_rows: &[serde_json::Value],
+    origin: &str,
+) -> Result<PluginSwitchEntry, String> {
+    let mut bundle_patch = None;
+    let mut client = false;
+    if let Some(dir) = package_dir(profile, package_name) {
+        let package = read_json(&dir.join("package.json")).unwrap_or_else(|_| serde_json::json!({}));
+        client = package_has_client(&package);
+        if let Some((rows, patch_text)) = bundle_patch_rows(&dir, &package)? {
+            bundle_patch = package
+                .pointer("/dsh/bundle/patch")
+                .and_then(|value| value.as_str())
+                .map(String::from);
+            if !rows.is_empty() {
+                return Ok(PluginSwitchEntry {
+                    name: package_name.to_string(),
+                    enabled: true,
+                    origin: origin.to_string(),
+                    rows,
+                    bundle_patch,
+                    patch_text: Some(patch_text),
+                    client,
+                });
+            }
+        }
+    }
+
+    // A package without `dsh.bundle.patch` can still be a plugin: it needs an
+    // explicit row in cordis.patch.yml. Reuse an existing row authored by the
+    // user so toggling does not duplicate the service.
+    let mut existing = Vec::new();
+    for row in patch_rows {
+        collect_rows_by_name(row, package_name, &mut existing);
+    }
+    if let Some(row) = existing.into_iter().last() {
+        return Ok(PluginSwitchEntry {
+            name: package_name.to_string(),
+            enabled: true,
+            origin: origin.to_string(),
+            rows: vec![row],
+            bundle_patch,
+            patch_text: None,
+            client,
+        });
+    }
+
+    Ok(PluginSwitchEntry {
+        name: package_name.to_string(),
+        enabled: true,
+        origin: origin.to_string(),
+        rows: vec![serde_json::json!({
+            "id": slug_id(package_name),
+            "name": package_name,
+        })],
+        bundle_patch,
+        patch_text: None,
+        client,
+    })
+}
+
+fn collect_bundle_targets(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+    fn walk(value: &serde_json::Value, out: &mut Vec<serde_json::Value>, inside_insert: bool) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out, inside_insert);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(insert) = map.get("insert") {
+                    walk(insert, out, true);
+                    return;
+                }
+                // Only rows the bundle patch *inserts* belong to the plugin;
+                // id-targeted overrides in the same file patch earlier rows
+                // and must not be disabled alongside the plugin.
+                if inside_insert {
+                    if let Some(id) = map.get("id").and_then(|id| id.as_str()) {
+                        let mut target = serde_json::json!({ "id": id });
+                        if let Some(name) = map.get("name").and_then(|name| name.as_str()) {
+                            target["name"] = serde_json::Value::String(name.to_string());
+                        }
+                        out.push(target);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(value, out, false);
+}
+
+fn boot_bundle_disable_rows(rows: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut targets = Vec::new();
+    for row in rows {
+        collect_bundle_targets(row, &mut targets);
+    }
+    targets
+        .into_iter()
+        .map(|mut target| {
+            target["disabled"] = serde_json::Value::Bool(true);
+            target
+        })
+        .collect()
+}
+
+fn normalize_patch_text_for_embed(text: &str) -> String {
+    let text = text.trim_start_matches('\u{feff}');
+    let mut lines = text.lines().collect::<Vec<_>>();
+    while lines.first().is_some_and(|line| line.trim() == "---") {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim() == "...") {
+        lines.pop();
+    }
+    let mut normalized = lines.join("\n");
+    if !normalized.is_empty() {
+        normalized.push('\n');
+    }
+    normalized
+}
+
+fn managed_patch_text(state: &PluginSwitchState) -> Result<String, String> {
+    let mut body = String::new();
+    for (name, entry) in &state.plugins {
+        let rows_text = if entry.origin == "boot-bundle" {
+            if entry.enabled {
+                // The boot-time bundle snapshot already composes these rows;
+                // writing them again would create duplicate entry ids.
+                None
+            } else {
+                Some(yaml_rows_string(&boot_bundle_disable_rows(&entry.rows))?)
+            }
+        } else if entry.enabled {
+            // Hot-layer plugins keep their original bundle patch text so
+            // `!!js` expressions and comments survive verbatim.
+            Some(match &entry.patch_text {
+                Some(text) => normalize_patch_text_for_embed(text),
+                None => yaml_rows_string(&entry.rows)?,
+            })
+        } else {
+            // Disabled hot-layer plugins are simply absent from the patch
+            // layer; removing the rows hot-unloads the plugin.
+            None
+        };
+        let Some(yaml) = rows_text else {
+            continue;
+        };
+        body.push_str(PLUGIN_BLOCK_MARKER);
+        body.push_str(name);
+        body.push('\n');
+        body.push_str(yaml.trim_end_matches('\n'));
+        body.push_str("\n\n");
+    }
+    Ok(format!("{PATCH_MANAGED_BEGIN}\n{body}{PATCH_MANAGED_END}\n"))
+}
+
+fn strip_managed_patch_section(text: &str) -> String {
+    let mut output = String::new();
+    let mut skipping = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if !skipping && trimmed == PATCH_MANAGED_BEGIN {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if trimmed == PATCH_MANAGED_END {
+                skipping = false;
+            }
+            continue;
+        }
+        output.push_str(line);
+    }
+    output
+}
+
+fn write_managed_patch(profile: &PathBuf, state: &PluginSwitchState) -> Result<(), String> {
+    let path = profile_patch_path(profile);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let base = strip_managed_patch_section(&existing);
+    let base = base.trim_end_matches(['\r', '\n']);
+    let managed = managed_patch_text(state)?;
+    let text = if base.is_empty() {
+        // A file containing only comments parses as YAML null, not as the
+        // top-level patch array DSH requires. Seed an empty list when the
+        // managed section would otherwise be the only content.
+        let managed_has_rows =
+            managed.starts_with("- ") || managed.contains("\n- ");
+        if managed_has_rows {
+            managed
+        } else {
+            format!("[]\n{managed}")
+        }
+    } else {
+        format!("{base}\n\n{managed}")
+    };
+    write_atomic(&path, &text)
+}
+
+/// Remove every state-managed plugin from the persisted profile bundle list.
+/// The managed patch layer owns those rows now, so the bundle layer must not
+/// duplicate them on the next restart.
+fn remove_state_plugins_from_bundles(
+    profile: &PathBuf,
+    state: &PluginSwitchState,
+) -> Result<(), String> {
+    let path = profile_manifest_path(profile);
+    let mut manifest = read_json(&path).unwrap_or_else(|_| serde_json::json!({}));
+    let bundles = manifest
+        .pointer("/dsh/profile/bundles")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let bundles = bundles
+        .into_iter()
+        .filter(|value| {
+            value
+                .as_str()
+                .map(|name| !state.plugins.contains_key(name))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if manifest.get("dsh").is_none() {
+        manifest["dsh"] = serde_json::json!({});
+    }
+    if manifest["dsh"].get("profile").is_none() {
+        manifest["dsh"]["profile"] = serde_json::json!({});
+    }
+    manifest["dsh"]["profile"]["bundles"] = serde_json::Value::Array(bundles);
+    write_json(&path, &manifest)
+}
+
+fn ensure_switch_entry(
+    profile: &PathBuf,
+    package_name: &str,
+    state: &mut PluginSwitchState,
+    origin: &str,
+) -> Result<PluginSwitchEntry, String> {
+    if let Some(entry) = state.plugins.get_mut(package_name) {
+        // Older state files predate the `client` flag. Re-discover it from
+        // the installed package so browser-half plugins always trigger the
+        // post-toggle page reload.
+        if !entry.client {
+            if let Some(dir) = package_dir(profile, package_name) {
+                if let Ok(package) = read_json(&dir.join("package.json")) {
+                    entry.client = package_has_client(&package);
+                }
+            }
+        }
+        return Ok(entry.clone());
+    }
+    let patch_rows = read_user_patch_rows(profile);
+    build_switch_entry(profile, package_name, &patch_rows, origin)
+}
+
+fn manifest_bundle_names(manifest: &serde_json::Value) -> Vec<String> {
+    manifest
+        .pointer("/dsh/profile/bundles")
+        .and_then(|value| value.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|value| value.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn dependency_names(manifest: &serde_json::Value) -> Vec<String> {
+    let mut names = manifest
+        .pointer("/dependencies")
+        .and_then(|value| value.as_object())
+        .map(|deps| deps.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+// ---------------------------------------------------------------------------
+// command plumbing
+// ---------------------------------------------------------------------------
+
+fn bundled_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
     let resource_root = app
         .path()
         .resolve("resources/runtime", tauri::path::BaseDirectory::Resource)
@@ -797,12 +1364,17 @@ fn plugin_manage(app: AppHandle, action: String, name: String) -> Result<String,
     if !node.exists() || !bin.exists() {
         return Err("bundled runtime is incomplete".to_string());
     }
+    Ok((node, bin))
+}
+
+fn run_plugin_command(app: &AppHandle, args: &[String]) -> Result<String, String> {
+    let (node, bin) = bundled_runtime(app)?;
     let home = resolve_dsh_home();
     let mut cmd = Command::new(&node);
     cmd.arg(&bin)
-        .args(["plugin", "--profile", "web", &action, &name])
+        .args(args)
         .env("DSH_HOME", &home)
-        .env("PATH", child_path(&app))
+        .env("PATH", child_path(app))
         .current_dir(&home);
     #[cfg(windows)]
     {
@@ -815,6 +1387,421 @@ fn plugin_manage(app: AppHandle, action: String, name: String) -> Result<String,
         return Err(combined);
     }
     Ok(combined)
+}
+
+fn ignored_build_keys(output: &str) -> Vec<String> {
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Ignored build scripts:") {
+            return rest
+                .trim()
+                .trim_end_matches('.')
+                .split(',')
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn run_plugin_action(
+    app: &AppHandle,
+    action: &str,
+    spec: &str,
+    allow_build: &[String],
+) -> Result<String, String> {
+    let mut args = vec![
+        "plugin".to_string(),
+        "--profile".to_string(),
+        PLUGIN_PROFILE.to_string(),
+        action.to_string(),
+    ];
+    if action == "add" {
+        for key in allow_build {
+            args.push(format!("--allow-build={key}"));
+        }
+    }
+    args.push(spec.to_string());
+    run_plugin_command(app, &args)
+}
+
+/// Turn a pasted GitHub URL into the pnpm shorthand `github:owner/repo`.
+/// Anything that is already a valid pnpm spec passes through unchanged.
+fn normalize_plugin_spec(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let github_path = |text: &str| -> Option<String> {
+        let text = text.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("git+")
+            .trim_start_matches("www.")
+            .trim_start_matches("github.com/");
+        let text = text.split('?').next().unwrap_or(text);
+        let (text, fragment) = match text.split_once('#') {
+            Some((path, fragment)) => (path, Some(fragment.trim_end_matches('/'))),
+            None => (text, None),
+        };
+        // `/tree/<branch>` in a browser URL is the same selector pnpm
+        // expresses as `github:owner/repo#<branch>`.
+        let (path, tree_branch) = match text.split_once("/tree/") {
+            Some((path, branch)) => (path, Some(branch.trim_end_matches('/'))),
+            None => (text, None),
+        };
+        let path = path.split("/blob/").next().unwrap_or(path);
+        let path = path.trim_end_matches('/');
+        let mut parts = path.split('/');
+        let owner = parts.next()?;
+        let repo = parts.next()?;
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        let repo = repo.trim_end_matches(".git");
+        if repo.is_empty() {
+            return None;
+        }
+        let branch = tree_branch.filter(|branch| !branch.is_empty()).or_else(|| fragment.filter(|branch| !branch.is_empty()));
+        Some(match branch {
+            Some(branch) => format!("{owner}/{repo}#{branch}"),
+            None => format!("{owner}/{repo}"),
+        })
+    };
+
+    if let Some(rest) = input.strip_prefix("git@github.com:") {
+        if let Some(repo) = github_path(rest) {
+            return format!("github:{repo}");
+        }
+    }
+    for prefix in [
+        "https://github.com/",
+        "http://github.com/",
+        "https://www.github.com/",
+        "http://www.github.com/",
+        "github.com/",
+        "git+https://github.com/",
+        "git+http://github.com/",
+    ] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            if let Some(repo) = github_path(rest) {
+                return format!("github:{repo}");
+            }
+        }
+    }
+    if input.starts_with("github:") {
+        if let Some(repo) = github_path(input.trim_start_matches("github:")) {
+            return format!("github:{repo}");
+        }
+    }
+
+    // `owner/repo` is not a valid npm package name, so it is unambiguous.
+    let bare = input.trim_end_matches('/');
+    if !bare.contains(':')
+        && !bare.contains('@')
+        && !bare.starts_with('.')
+        && !bare.starts_with('/')
+        && bare.split('/').count() == 2
+        && !bare.contains(' ')
+    {
+        if let Some(repo) = github_path(bare) {
+            return format!("github:{repo}");
+        }
+    }
+
+    input.to_string()
+}
+
+#[tauri::command]
+fn plugin_list(app: AppHandle, app_state: tauri::State<'_, AppState>) -> PluginList {
+    let home = resolve_dsh_home();
+    let profile = profile_dir(&home);
+    let (profile_path, manifest) = read_profile_manifest(&home).unwrap_or_else(|| {
+        (
+            profile_manifest_path(&profile).display().to_string(),
+            serde_json::json!({}),
+        )
+    });
+    let bundles: Vec<String> = manifest_bundle_names(&manifest);
+    let generation = current_harness_generation(&app_state);
+    let mut state = load_plugin_state(&profile);
+    let _ = refresh_plugin_state_generation(&profile, &mut state, generation, &bundles);
+    let user_patch_rows = read_user_patch_rows(&profile);
+    let dependencies = manifest
+        .pointer("/dependencies")
+        .and_then(|v| v.as_object())
+        .map(|deps| {
+            deps.iter()
+                .map(|(name, spec)| {
+                    let enabled = if let Some(entry) = state.plugins.get(name) {
+                        entry.enabled
+                    } else {
+                        let mut matches = Vec::new();
+                        for row in &user_patch_rows {
+                            collect_rows_by_name(row, name, &mut matches);
+                        }
+                        match matches.last() {
+                            Some(row) => row.get("disabled").and_then(|d| d.as_bool()) != Some(true),
+                            None => bundles.iter().any(|bundle| bundle == name),
+                        }
+                    };
+                    let managed = state.plugins.contains_key(name)
+                        || user_patch_rows.iter().any(|row| {
+                            let mut matches = Vec::new();
+                            collect_rows_by_name(row, name, &mut matches);
+                            !matches.is_empty()
+                        });
+                    let client = package_dir(&profile, name)
+                        .and_then(|dir| read_json(&dir.join("package.json")).ok())
+                        .map(|package| package_has_client(&package))
+                        .unwrap_or_else(|| {
+                            state.plugins.get(name).map(|entry| entry.client).unwrap_or(false)
+                        });
+                    PluginDependency {
+                        name: name.clone(),
+                        spec: spec.clone(),
+                        enabled,
+                        managed,
+                        client,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pnpm = tools_dir(&app)
+        .map(|dir| dir.join("pnpm.exe").exists() || dir.join("pnpm").join("pnpm.exe").exists())
+        .unwrap_or(false);
+    PluginList {
+        home: home.display().to_string(),
+        profile: profile_path,
+        bundles,
+        dependencies,
+        pnpm,
+    }
+}
+
+/// Hot-enable/disable an installed plugin by rewriting the DSH Desktop
+/// section of `profiles/web/cordis.patch.yml`. The running harness watches
+/// that file through Cordis HMR and applies the row changes immediately.
+#[tauri::command]
+fn plugin_set_enabled(
+    name: String,
+    enabled: bool,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<PluginToggleResult, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("plugin name is empty".to_string());
+    }
+    let home = resolve_dsh_home();
+    let profile = profile_dir(&home);
+    let mut state = load_plugin_state(&profile);
+    let generation = current_harness_generation(&app_state);
+    let manifest = read_profile_manifest(&home)
+        .map(|(_, manifest)| manifest)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let is_installed = manifest
+        .pointer("/dependencies")
+        .and_then(|deps| deps.as_object())
+        .map(|deps| deps.contains_key(&name))
+        .unwrap_or(false);
+    if !is_installed {
+        return Err(format!("{name} is not installed in the web profile"));
+    }
+    let bundles = manifest_bundle_names(&manifest);
+    let _ = refresh_plugin_state_generation(&profile, &mut state, generation, &bundles)?;
+    let origin = if let Some(existing) = state.plugins.get(&name) {
+        existing.origin.clone()
+    } else if bundles.iter().any(|bundle| bundle == &name) {
+        "boot-bundle".to_string()
+    } else {
+        "hot-layer".to_string()
+    };
+    let mut entry = ensure_switch_entry(&profile, &name, &mut state, &origin)?;
+    entry.name = name.clone();
+    entry.origin = origin;
+    entry.enabled = enabled;
+    let reload = entry.client;
+    state.plugins.insert(name.clone(), entry);
+    save_plugin_state(&profile, &state)?;
+    write_managed_patch(&profile, &state)?;
+    remove_state_plugins_from_bundles(&profile, &state)?;
+    Ok(PluginToggleResult {
+        message: format!(
+            "[dsh-desktop] {name} {} — cordis HMR is applying the patch layer now",
+            if enabled { "enabled" } else { "disabled" }
+        ),
+        reload,
+    })
+}
+
+/// Forward a `dsh plugin` operation to pnpm through the bundled runtime and
+/// keep the hot-swap patch layer in sync afterwards.
+#[tauri::command]
+fn plugin_manage(
+    app: AppHandle,
+    action: String,
+    name: String,
+    app_state: tauri::State<'_, AppState>,
+) -> Result<PluginManageResult, String> {
+    if action != "add" && action != "remove" {
+        return Err(format!("unknown plugin action {action:?}"));
+    }
+    let raw = name.trim().to_string();
+    if raw.is_empty() {
+        return Err("plugin spec is empty".to_string());
+    }
+    let spec = if action == "add" {
+        normalize_plugin_spec(&raw)
+    } else {
+        raw.clone()
+    };
+
+    let home = resolve_dsh_home();
+    let profile = profile_dir(&home);
+    let manifest_before = read_profile_manifest(&home)
+        .map(|(_, manifest)| manifest)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let names_before = dependency_names(&manifest_before);
+    let bundles_before = manifest_bundle_names(&manifest_before);
+    let mut state = load_plugin_state(&profile);
+    let generation = current_harness_generation(&app_state);
+    let _ = refresh_plugin_state_generation(&profile, &mut state, generation, &bundles_before)?;
+
+    let mut client_changes = Vec::new();
+    if action == "remove" {
+        // Disable first (hot-unload), then let pnpm remove the package. The
+        // disabled tombstone stays in the patch layer so the running process
+        // never tries to re-import a package that has just been deleted.
+        let origin = if let Some(existing) = state.plugins.get(&raw) {
+            existing.origin.clone()
+        } else if bundles_before.iter().any(|bundle| bundle == &raw) {
+            "boot-bundle".to_string()
+        } else {
+            "hot-layer".to_string()
+        };
+        let mut entry = ensure_switch_entry(&profile, &raw, &mut state, &origin)?;
+        entry.name = raw.clone();
+        entry.origin = origin;
+        entry.enabled = false;
+        let client = entry.client;
+        state.plugins.insert(raw.clone(), entry);
+        save_plugin_state(&profile, &state)?;
+        write_managed_patch(&profile, &state)?;
+        remove_state_plugins_from_bundles(&profile, &state)?;
+        if client {
+            client_changes.push(raw.clone());
+        }
+    }
+
+    let no_build_keys = Vec::new();
+    let mut output = match run_plugin_action(&app, &action, &spec, &no_build_keys) {
+        Ok(output) => output,
+        Err(first_error) if action == "add" => {
+            // pnpm 10+ blocks git-hosted build scripts until approved. Retry
+            // with the exact build keys pnpm reported; the panel then behaves
+            // like "paste a GitHub URL and install".
+            let build_keys = ignored_build_keys(&first_error);
+            if !build_keys.is_empty() {
+                run_plugin_action(&app, &action, &spec, &build_keys)?
+            } else if first_error.contains("EPERM") && first_error.contains("package.json") {
+                // The running harness can briefly hold the profile manifest
+                // on Windows. pnpm usually already installed the dependency
+                // when this happens; a single delayed retry reconciles it.
+                thread::sleep(Duration::from_millis(450));
+                run_plugin_action(&app, &action, &spec, &no_build_keys)?
+            } else {
+                return Err(first_error);
+            }
+        }
+        Err(error) => return Err(error),
+    };
+
+    if action == "add" {
+        let manifest_after = read_profile_manifest(&home)
+            .map(|(_, manifest)| manifest)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let names_after = dependency_names(&manifest_after);
+        let installed = names_after
+            .iter()
+            .filter(|name| !names_before.contains(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed = if installed.is_empty() {
+            // Reinstalling/updating an existing dependency can keep the
+            // manifest key unchanged. Map the obvious package-name forms.
+            match spec_name_for_existing(&spec) {
+                Some(name) if names_after.iter().any(|entry| entry == &name) => vec![name],
+                _ => Vec::new(),
+            }
+        } else {
+            installed
+        };
+
+        if !changed.is_empty() {
+            for package_name in &changed {
+                // A removed boot-bundle plugin leaves a disabled tombstone
+                // while this harness run is still alive. Reinstalling it in
+                // the same run must stay override-based (`boot-bundle`) or
+                // the hot patch would duplicate the boot snapshot rows.
+                let previous_origin = state
+                    .plugins
+                    .get(package_name)
+                    .map(|entry| entry.origin.clone())
+                    .unwrap_or_else(|| "hot-layer".to_string());
+                let mut entry = ensure_switch_entry(&profile, package_name, &mut state, &previous_origin)?;
+                entry.name = package_name.clone();
+                entry.origin = previous_origin;
+                entry.enabled = true;
+                if entry.client {
+                    client_changes.push(package_name.clone());
+                }
+                state.plugins.insert(package_name.clone(), entry);
+            }
+            save_plugin_state(&profile, &state)?;
+            write_managed_patch(&profile, &state)?;
+            remove_state_plugins_from_bundles(&profile, &state)?;
+            output.push_str(&format!(
+                "\n[dsh-desktop] {} hot-loaded through cordis HMR — no restart needed",
+                changed.join(", ")
+            ));
+        } else {
+            output.push_str(
+                "\n[dsh-desktop] pnpm completed; the installed package could not be mapped to a profile dependency",
+            );
+        }
+    }
+
+    Ok(PluginManageResult {
+        reload: !client_changes.is_empty(),
+        clients: client_changes,
+        output,
+    })
+}
+
+/// Best-effort mapping for plain package specs when an add operation did not
+/// create a new manifest key (for example `pnpm add <name>@latest`).
+fn spec_name_for_existing(spec: &str) -> Option<String> {
+    if let Some(path) = spec.strip_prefix("file:").or_else(|| spec.strip_prefix("link:")) {
+        let path = std::path::Path::new(path);
+        let package = read_json(&path.join("package.json")).ok()?;
+        return package.get("name").and_then(|name| name.as_str()).map(String::from);
+    }
+    if spec.starts_with('@') && spec.contains('/') {
+        // @scope/name or @scope/name@version. The scope separator is the
+        // first @, so rfind finds the optional version range separator.
+        let rest = &spec[1..];
+        let name = match rest.rfind('@') {
+            Some(pos) if pos > 0 => format!("@{}", &rest[..pos]),
+            _ => spec.to_string(),
+        };
+        return Some(name);
+    }
+    if spec.contains(':') || spec.contains('/') || spec.contains(' ') {
+        return None;
+    }
+    Some(spec.split('@').next().unwrap_or(spec).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -835,7 +1822,7 @@ pub fn run() {
             show_main(app);
         }))
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![boot_state, retry_boot, reveal_logs, stage_attachments, plugin_list, plugin_manage])
+        .invoke_handler(tauri::generate_handler![boot_state, retry_boot, reveal_logs, stage_attachments, plugin_list, plugin_manage, plugin_set_enabled])
         .setup(|app| {
             let handle = app.handle().clone();
             build_tray(&handle)?;
@@ -871,4 +1858,272 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_github_urls() {
+        assert_eq!(
+            normalize_plugin_spec("https://github.com/foo/bar"),
+            "github:foo/bar"
+        );
+        assert_eq!(
+            normalize_plugin_spec("https://github.com/foo/bar.git"),
+            "github:foo/bar"
+        );
+        assert_eq!(
+            normalize_plugin_spec("https://github.com/foo/bar/tree/next"),
+            "github:foo/bar#next"
+        );
+        assert_eq!(
+            normalize_plugin_spec("github.com/foo/bar"),
+            "github:foo/bar"
+        );
+        assert_eq!(
+            normalize_plugin_spec("git@github.com:foo/bar.git"),
+            "github:foo/bar"
+        );
+        assert_eq!(normalize_plugin_spec("foo/bar"), "github:foo/bar");
+        assert_eq!(
+            normalize_plugin_spec("git+https://github.com/foo/bar"),
+            "github:foo/bar"
+        );
+        assert_eq!(
+            normalize_plugin_spec("@scope/plugin@^1.0.0"),
+            "@scope/plugin@^1.0.0"
+        );
+        assert_eq!(
+            normalize_plugin_spec("file:../local-plugin"),
+            "file:../local-plugin"
+        );
+    }
+
+    #[test]
+    fn generation_refresh_moves_unbundled_entries_to_hot_layer() {
+        let base = std::env::temp_dir().join(format!("dsh-gen-test-{}", std::process::id()));
+        let profile = base.join("profiles").join("web");
+        std::fs::create_dir_all(&profile).expect("create temp profile");
+        std::fs::write(profile.join("cordis.patch.yml"), "[]\n").expect("patch");
+        std::fs::write(
+            profile.join("package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dependencies": {},
+                "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base"] } }
+            }))
+            .expect("json"),
+        )
+        .expect("manifest");
+
+        let mut state = PluginSwitchState {
+            version: 3,
+            generation: 0,
+            plugins: BTreeMap::from([(
+                "demo-plugin".to_string(),
+                PluginSwitchEntry {
+                    name: "demo-plugin".to_string(),
+                    enabled: false,
+                    origin: "boot-bundle".to_string(),
+                    rows: vec![serde_json::json!({
+                        "insert": [{"id": "demo", "name": "demo-plugin"}]
+                    })],
+                    bundle_patch: None,
+                    patch_text: None,
+                    client: false,
+                },
+            )]),
+        };
+        let changed = refresh_plugin_state_generation(
+            &profile,
+            &mut state,
+            2,
+            &["@deepseek-ai/dsh-base".to_string()],
+        )
+        .expect("refresh");
+        assert!(changed);
+        assert_eq!(state.plugins["demo-plugin"].origin, "hot-layer");
+        assert_eq!(state.generation, 2);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn boot_bundle_entries_use_overrides_not_duplicate_inserts() {
+        let state = PluginSwitchState {
+            version: 3,
+            generation: 1,
+            plugins: BTreeMap::from([(
+                "dsh-tavern".to_string(),
+                PluginSwitchEntry {
+                    name: "dsh-tavern".to_string(),
+                    enabled: false,
+                    origin: "boot-bundle".to_string(),
+                    rows: vec![serde_json::json!({
+                        "insert": [{"id": "tavern", "name": "dsh-tavern"}]
+                    })],
+                    bundle_patch: Some("cordis.patch.yml".to_string()),
+                    patch_text: None,
+                    client: false,
+                },
+            )]),
+        };
+        let managed = managed_patch_text(&state).expect("managed patch");
+        assert!(!managed.contains("insert:"));
+        assert!(managed.contains("id: tavern"));
+        assert!(managed.contains("disabled: true"));
+        let parsed = parse_yaml_to_json_array(&managed).expect("valid YAML");
+        assert_eq!(parsed[0]["id"], "tavern");
+
+        let mut enabled = state.clone();
+        enabled.plugins.get_mut("dsh-tavern").unwrap().enabled = true;
+        let managed = managed_patch_text(&enabled).expect("managed patch");
+        assert!(!managed.contains("dsh-desktop:plugin dsh-tavern"));
+    }
+
+    #[test]
+    fn managed_files_round_trip_without_losing_user_patch() {
+        let base = std::env::temp_dir().join(format!("dsh-plugin-test-{}", std::process::id()));
+        let profile = base.join("profiles").join("web");
+        std::fs::create_dir_all(&profile).expect("create temp profile");
+        std::fs::write(
+            profile.join("cordis.patch.yml"),
+            "# user patch\n- id: pwsh-sandbox\n  disabled: true\n",
+        )
+        .expect("write user patch");
+        std::fs::write(
+            profile.join("package.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "dsh-profile-web",
+                "dependencies": { "demo-plugin": "github:foo/demo" },
+                "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "demo-plugin"] } }
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+
+        let state = PluginSwitchState {
+            version: 3,
+            generation: 1,
+            plugins: BTreeMap::from([(
+                "demo-plugin".to_string(),
+                PluginSwitchEntry {
+                    name: "demo-plugin".to_string(),
+                    enabled: true,
+                    origin: "hot-layer".to_string(),
+                    rows: vec![serde_json::json!({
+                        "insert": [{"id": "demo", "name": "demo-plugin"}]
+                    })],
+                    bundle_patch: None,
+                    patch_text: None,
+                    client: false,
+                },
+            )]),
+        };
+        save_plugin_state(&profile, &state).expect("save state");
+        write_managed_patch(&profile, &state).expect("write managed patch");
+        remove_state_plugins_from_bundles(&profile, &state).expect("sync bundles");
+
+        let patch = std::fs::read_to_string(profile.join("cordis.patch.yml")).expect("patch");
+        assert!(patch.contains("# user patch"));
+        assert!(patch.contains("# dsh-desktop:plugin demo-plugin"));
+        let rows = parse_yaml_to_json_array(&patch).expect("patch parses");
+        assert!(rows.iter().any(|row| row["id"] == "pwsh-sandbox"));
+        assert!(rows.iter().any(|row| row["insert"][0]["id"] == "demo"));
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(profile.join("package.json")).expect("manifest"))
+                .expect("manifest parses");
+        let bundles = manifest_bundle_names(&manifest);
+        assert_eq!(bundles, vec!["@deepseek-ai/dsh-base".to_string()]);
+
+        let loaded = load_plugin_state(&profile);
+        assert_eq!(loaded.generation, 1);
+        assert_eq!(loaded.plugins["demo-plugin"].origin, "hot-layer");
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn hot_layer_entries_keep_full_insert_rows() {
+        let state = PluginSwitchState {
+            version: 3,
+            generation: 1,
+            plugins: BTreeMap::from([(
+                "demo-plugin".to_string(),
+                PluginSwitchEntry {
+                    name: "demo-plugin".to_string(),
+                    enabled: true,
+                    origin: "hot-layer".to_string(),
+                    rows: vec![serde_json::json!({
+                        "insert": [{"id": "demo", "name": "demo-plugin"}]
+                    })],
+                    bundle_patch: Some("cordis.patch.yml".to_string()),
+                    patch_text: None,
+                    client: false,
+                },
+            )]),
+        };
+        let managed = managed_patch_text(&state).expect("managed patch");
+        assert!(managed.contains("insert:"));
+        assert!(managed.contains("id: demo"));
+        let parsed = parse_yaml_to_json_array(&managed).expect("valid YAML");
+        assert_eq!(parsed[0]["insert"][0]["id"], "demo");
+    }
+
+    #[test]
+    fn hot_layer_preserves_raw_bundle_patch_text() {
+        let raw = "- insert:\n    - id: demo\n      name: demo-plugin\n      config:\n        enabled: !!js '() => true'\n";
+        let state = PluginSwitchState {
+            version: 3,
+            generation: 1,
+            plugins: BTreeMap::from([(
+                "demo-plugin".to_string(),
+                PluginSwitchEntry {
+                    name: "demo-plugin".to_string(),
+                    enabled: true,
+                    origin: "hot-layer".to_string(),
+                    rows: vec![serde_json::json!({
+                        "insert": [{"id": "demo", "name": "demo-plugin"}]
+                    })],
+                    bundle_patch: Some("cordis.patch.yml".to_string()),
+                    patch_text: Some(raw.to_string()),
+                    client: true,
+                },
+            )]),
+        };
+        let managed = managed_patch_text(&state).expect("managed patch");
+        assert!(managed.contains("!!js '() => true'"), "managed: {managed}");
+        assert!(managed.contains("id: demo"));
+    }
+
+    #[test]
+    fn managed_section_survives_user_edits() {
+        let state = PluginSwitchState {
+            version: 3,
+            generation: 0,
+            plugins: BTreeMap::from([(
+                "demo-plugin".to_string(),
+                PluginSwitchEntry {
+                    name: "demo-plugin".to_string(),
+                    enabled: false,
+                    origin: "boot-bundle".to_string(),
+                    rows: vec![serde_json::json!({
+                        "insert": [{"id": "demo", "name": "demo-plugin"}]
+                    })],
+                    bundle_patch: None,
+                    patch_text: None,
+                    client: false,
+                },
+            )]),
+        };
+        let managed = managed_patch_text(&state).expect("managed patch");
+        assert!(managed.contains("# dsh-desktop:plugin demo-plugin"));
+        assert!(managed.contains("disabled: true"));
+
+        let user = "# user patch\n- id: something\n  disabled: true\n";
+        let mixed = format!("{user}{managed}");
+        let stripped = strip_managed_patch_section(&mixed);
+        assert!(stripped.contains("# user patch"));
+        assert!(!stripped.contains("dsh-desktop:plugin demo-plugin"));
+    }
 }

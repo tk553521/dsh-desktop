@@ -56,11 +56,12 @@ Harness 界面通过 `--dsw-static-*` / `--dsw-alias-*` CSS 变量做了完整�
 - **补丁层（Patch layers）** —— `%DSH_HOME%/profiles/web/cordis.patch.yml` 和 `%DSH_HOME%/cordis.patch.yml` 会被监听并像 CLI 一样热重载。
 - **Bundle 层** —— 声明了 `dsh.bundle.patch` 的包会加入 `dsh.profile.bundles`，其补丁在启动时合成。
 - **客户端插件** —— 声明了 `dsh.client`（platform 为 "web"）以及 `exports["./client"]` 入口的包，会在 `/plugins/<pkg>/client.js` 提供并自动注入 `window.__DSH_BOOT__`。
-- **插件管理器** —— 悬浮标题栏的拼图按钮打开玻璃面板：通过内置 `pnpm`（v11，standalone）安装/卸载、列出各层和已安装包、重启 Harness 以合成新 bundle。它对接的正是 CLI 所用的 `dsh plugin --profile web` pnpm 协议，因此 registry 源、`file:`/`link:` 路径以及 git 源都可以用。
+- **插件管理器** —— 悬浮标题栏的拼图按钮打开玻璃面板：输入 GitHub 仓库地址（或任意 pnpm 可识别的包 spec）即可安装，已安装插件带开关，通过 Cordis HMR 热插拔，无需重启 Harness。安装仍走 CLI 所用的 `dsh plugin --profile web` pnpm 协议，因此 registry 源、`file:`/`link:` 路径以及 git 源都可以用。
+  （带浏览器半的插件在热切换后会自动等待 host graph 更新并刷新 WebView；Harness 进程和会话不重启。）
 
 `plugins/demo-plugin/` 是一个可运行示例（server 半区带 `/demo` 路由 + browser 半区带一个徽标）；在面板里用 `file:<repo>/plugins/demo-plugin` 即可安装。
 
-已知限制：`dsh plugin` 需要 pnpm；exe 内置了它（见 `resources/tools/pnpm/`）。git 托管插件的构建脚本默认被 pnpm 的供应链策略拦截，需在 profile 的 `pnpm-workspace.yaml` 中通过 `allowBuilds` 放行。
+已知限制：`dsh plugin` 需要 pnpm；exe 内置了它（见 `resources/tools/pnpm/`）。git 托管插件的构建脚本默认被 pnpm 的供应链策略拦截；桌面面板会读取 pnpm 报出的 build key 并自动用 `--allow-build` 重试放行。
 
 ## 构建
 

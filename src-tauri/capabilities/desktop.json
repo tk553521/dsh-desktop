@@ -21,7 +21,8 @@
     "allow-reveal-logs",
     "allow-stage-attachments",
     "allow-plugin-list",
-    "allow-plugin-manage"
+    "allow-plugin-manage",
+    "allow-plugin-set-enabled"
   ],
   "remote": {
     "urls": [
