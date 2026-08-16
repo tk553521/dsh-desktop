@@ -1019,6 +1019,49 @@ fn collect_rows_by_name(
     }
 }
 
+/// Find every row that LOADS `package_name` (a row whose `name` field names
+/// the package) while preserving how the row must be written back. The loader
+/// only loads packages from `insert` lists: a bare top-level row is an
+/// id-targeted override that is skipped with an "entry not found" warning
+/// when no row with that id exists yet. A row found inside an `insert` list
+/// therefore keeps its insert wrapper, so reusing it for a hot-layer toggle
+/// still activates the package instead of silently writing a dead override.
+fn collect_load_rows_by_name(
+    value: &serde_json::Value,
+    package_name: &str,
+    out: &mut Vec<serde_json::Value>,
+) {
+    collect_load_rows_inner(value, package_name, out, false);
+}
+
+fn collect_load_rows_inner(
+    value: &serde_json::Value,
+    package_name: &str,
+    out: &mut Vec<serde_json::Value>,
+    in_insert: bool,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_load_rows_inner(item, package_name, out, in_insert);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.get("name").and_then(|name| name.as_str()) == Some(package_name) {
+                if in_insert {
+                    out.push(serde_json::json!({ "insert": [value.clone()] }));
+                } else {
+                    out.push(value.clone());
+                }
+            }
+            for (key, child) in map {
+                collect_load_rows_inner(child, package_name, out, in_insert || key == "insert");
+            }
+        }
+        _ => {}
+    }
+}
+
 fn read_user_patch_rows(profile: &PathBuf) -> Vec<serde_json::Value> {
     let path = profile_patch_path(profile);
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1093,10 +1136,13 @@ fn build_switch_entry(
 
     // A package without `dsh.bundle.patch` can still be a plugin: it needs an
     // explicit row in cordis.patch.yml. Reuse an existing row authored by the
-    // user so toggling does not duplicate the service.
+    // user so toggling does not duplicate the service. Rows inside an `insert`
+    // list keep their wrapper (see collect_load_rows_by_name) — the loader
+    // treats a bare row as an id-targeted override, so stripping the wrapper
+    // would write back a row that can never load the package.
     let mut existing = Vec::new();
     for row in patch_rows {
-        collect_rows_by_name(row, package_name, &mut existing);
+        collect_load_rows_by_name(row, package_name, &mut existing);
     }
     if let Some(row) = existing.into_iter().last() {
         return Ok(PluginSwitchEntry {
@@ -1114,9 +1160,16 @@ fn build_switch_entry(
         name: package_name.to_string(),
         enabled: true,
         origin: origin.to_string(),
+        // The loader only loads packages from `insert` lists; a bare row is an
+        // id-targeted override and is skipped with an "entry not found"
+        // warning when no row with that id exists yet. Generate the load row
+        // inside an insert so toggling a bundle-less plugin actually
+        // activates it.
         rows: vec![serde_json::json!({
-            "id": slug_id(package_name),
-            "name": package_name,
+            "insert": [{
+                "id": slug_id(package_name),
+                "name": package_name,
+            }]
         })],
         bundle_patch,
         patch_text: None,
@@ -2125,5 +2178,83 @@ mod tests {
         let stripped = strip_managed_patch_section(&mixed);
         assert!(stripped.contains("# user patch"));
         assert!(!stripped.contains("dsh-desktop:plugin demo-plugin"));
+    }
+
+    #[test]
+    fn bundleless_plugin_generates_insert_load_row() {
+        let base = std::env::temp_dir().join(format!("dsh-switch-{}", std::process::id()));
+        let profile = base.join("profiles").join("web");
+        let pkg = profile.join("node_modules").join("demo-plugin");
+        std::fs::create_dir_all(&pkg).expect("create package dir");
+        std::fs::write(
+            pkg.join("package.json"),
+            serde_json::to_string(&serde_json::json!({
+                "name": "demo-plugin",
+                "version": "1.0.0",
+                "main": "lib/index.js"
+            }))
+            .expect("json"),
+        )
+        .expect("write package");
+
+        let entry = build_switch_entry(&profile, "demo-plugin", &[], "hot-layer").expect("entry");
+        assert_eq!(entry.rows.len(), 1);
+        // The generated row must be an insert: a bare row is an id-targeted
+        // override that the loader skips ("entry not found").
+        assert_eq!(entry.rows[0]["insert"][0]["id"], "dsh-desktop-demo-plugin");
+        assert_eq!(entry.rows[0]["insert"][0]["name"], "demo-plugin");
+
+        let managed = managed_patch_text(&PluginSwitchState {
+            version: 3,
+            generation: 1,
+            plugins: BTreeMap::from([(
+                "demo-plugin".to_string(),
+                PluginSwitchEntry {
+                    name: "demo-plugin".to_string(),
+                    enabled: true,
+                    origin: "hot-layer".to_string(),
+                    rows: entry.rows.clone(),
+                    bundle_patch: None,
+                    patch_text: None,
+                    client: false,
+                },
+            )]),
+        })
+        .expect("managed patch");
+        assert!(managed.contains("insert:"));
+        assert!(managed.contains("id: dsh-desktop-demo-plugin"));
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn bundleless_plugin_reuses_user_insert_row_with_wrapper() {
+        let base = std::env::temp_dir().join(format!("dsh-reuse-{}", std::process::id()));
+        let profile = base.join("profiles").join("web");
+        let pkg = profile.join("node_modules").join("demo-plugin");
+        std::fs::create_dir_all(&pkg).expect("create package dir");
+        std::fs::write(
+            pkg.join("package.json"),
+            serde_json::to_string(&serde_json::json!({
+                "name": "demo-plugin",
+                "version": "1.0.0",
+                "main": "lib/index.js"
+            }))
+            .expect("json"),
+        )
+        .expect("write package");
+
+        let patch_rows = parse_yaml_to_json_array(
+            "- insert:\n    - id: demo\n      name: demo-plugin\n      config:\n        foo: bar\n",
+        )
+        .expect("patch parses");
+        let entry =
+            build_switch_entry(&profile, "demo-plugin", &patch_rows, "hot-layer").expect("entry");
+        assert_eq!(entry.rows.len(), 1);
+        // The reused row keeps its insert wrapper, so writing it back still
+        // loads the package instead of degrading to a dead override.
+        assert_eq!(entry.rows[0]["insert"][0]["id"], "demo");
+        assert_eq!(entry.rows[0]["insert"][0]["name"], "demo-plugin");
+        assert_eq!(entry.rows[0]["insert"][0]["config"]["foo"], "bar");
+        std::fs::remove_dir_all(base).ok();
     }
 }
