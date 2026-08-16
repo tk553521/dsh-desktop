@@ -12,6 +12,7 @@
 // file is missing. Network is only needed the first time (or after a version bump).
 import {
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -43,7 +44,9 @@ const pnpmExe = join(toolsDir, "pnpm.exe");
 const distFontsDir = join(root, "dist", "fonts");
 const skinFontsDir = join(root, "skin", "fonts");
 
-// Standalone pnpm (Bun-compiled single exe) shipped via the npm registry.
+// Standalone pnpm: a Node SEA exe (`@pnpm/win-x64`) whose embedded entry
+// loads the esbuild bundle from `dist/pnpm.mjs` next to the exe at runtime —
+// so the tool directory must ship the exe AND the `pnpm` package's `dist/`.
 const PNPM_VERSION = "11.21.0";
 
 function fail(msg) {
@@ -151,8 +154,9 @@ function installRuntime() {
 }
 
 function ensurePnpm() {
-  if (existsSync(pnpmExe)) {
-    console.log("[prepare-runtime] pnpm.exe already present");
+  const distDir = join(toolsDir, "dist");
+  if (existsSync(pnpmExe) && existsSync(join(distDir, "pnpm.mjs"))) {
+    console.log("[prepare-runtime] pnpm.exe + dist/ already present");
     return;
   }
   console.log(`[prepare-runtime] fetching standalone pnpm ${PNPM_VERSION} ...`);
@@ -166,12 +170,16 @@ function ensurePnpm() {
   const tmp = join(root, ".tmp-pnpm");
   rmSync(tmp, { recursive: true, force: true });
   mkdirSync(tmp, { recursive: true });
+  // One install invocation: sequential `npm install --prefix` calls prune each
+  // other's packages (nothing is saved to a manifest), so both specs must go
+  // into a single command.
   const status = run(
     process.execPath,
     [
       cli,
       "install",
       `@pnpm/win-x64@${PNPM_VERSION}`,
+      `pnpm@${PNPM_VERSION}`,
       "--prefix",
       tmp,
       "--no-save",
@@ -183,11 +191,17 @@ function ensurePnpm() {
     ],
     { cwd: tmp },
   );
-  const src = join(tmp, "node_modules", "@pnpm", "win-x64", "pnpm.exe");
-  if (status === 0 && existsSync(src)) {
+  // The SEA exe resolves `dist/pnpm.mjs` relative to itself, so the bundle
+  // must sit next to the exe. `pnpm@<version>` carries that dist/ payload
+  // (pnpm.mjs, worker.js, node-gyp, templates, ...) in its package.
+  const exeSrc = join(tmp, "node_modules", "@pnpm", "win-x64", "pnpm.exe");
+  const distSrc = join(tmp, "node_modules", "pnpm", "dist");
+  if (status === 0 && existsSync(exeSrc) && existsSync(distSrc)) {
     mkdirSync(toolsDir, { recursive: true });
-    copyFileSync(src, pnpmExe);
-    console.log(`[prepare-runtime] pnpm.exe (v${PNPM_VERSION}) installed`);
+    copyFileSync(exeSrc, pnpmExe);
+    rmSync(distDir, { recursive: true, force: true });
+    cpSync(distSrc, distDir, { recursive: true });
+    console.log(`[prepare-runtime] pnpm.exe + dist/ (v${PNPM_VERSION}) installed`);
   } else {
     console.warn(
       "[prepare-runtime] WARN: could not fetch pnpm — plugin install will be unavailable, but the build continues",
