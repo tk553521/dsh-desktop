@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-log-query"
+description = "Enables the log_query command without any pre-configured scope."
+commands.allow = ["log_query"]
+
+[[permission]]
+identifier = "deny-log-query"
+description = "Denies the log_query command without any pre-configured scope."
+commands.deny = ["log_query"]

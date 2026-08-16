@@ -19,6 +19,7 @@ DeepSeek Harness（DSH）的 **Tauri 桌面版** —— 把完整的浏览器代
 dist/index.html           启动画面（WebGL 极光、动态文字）
 src-tauri/                Tauri 外壳
   src/lib.rs              启动流程：spawn/复用 `dsh web`、托盘、窗口
+  src/logging.rs          结构化运行时日志：分级/分模块/分类型、ring buffer + JSONL
   scripts/init.js         生成的皮肤注入 bundle（见下文）
   resources/runtime/      内置运行时（清单入库，产物生成，见下文）：
     package.json          提交的依赖清单（@deepseek-ai/dsh@0.1.0-rc.6）
@@ -37,6 +38,16 @@ scripts/
   cdp.ps1                 WebView2 CDP 调试探针（debug 构建暴露 :9333）
   analyze-shot.mjs        像素级截图分析
 ```
+
+## 运行时日志
+
+标题栏的终端按钮打开 Runtime Log 面板：
+
+- **三级分类** —— `level`（TRACE/DEBUG/INFO/WARN/ERROR/FATAL）、`module`（app/boot/harness/plugin/window/tray/attachment/ipc/logger）、`type`（lifecycle/network/process/file/ipc/command/performance/stdout/stderr 等）。
+- **事无巨细** —— 端口探测、进程 spawn、harness stdout/stderr 逐行、插件 pnpm 输出、附件暂存、窗口/托盘事件全部入日志。
+- **搜索与过滤** —— 空白分词 AND 搜索，覆盖时间/级别/模块/类型/正文；三个维度可组合过滤，支持翻页加载更旧记录。
+- **颜色与阅读** —— 级别决定左侧色条和徽章颜色，模块/类型各有色码；支持 live tail 暂停、复制当前结果、打开日志目录。
+- **双持久化** —— 内存 ring buffer（5000 条，UI 内搜索）与 `%APPDATA%/dev.dsh.desktop/logs/dsh-desktop.log`（JSONL，8 MB 自动轮转为 `.1.log`）；`dsh-web.log` 仍保留 harness 原始输出。
 
 ## 启动流程
 
