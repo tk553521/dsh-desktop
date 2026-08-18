@@ -1858,6 +1858,313 @@ fn spec_name_for_existing(spec: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// MCP management
+//
+// The desktop wrapper scans the Claude-Code-style `.mcp.json` registries the
+// user keeps in the OS home (global `~/.mcp.json`), the DSH home, and every
+// known DSH workspace, then presents the merged servers as a management list
+// with per-server enable/disable switches. Disabling moves a server into a
+// `mcpServersDisabled` companion object inside the same file — definitions are
+// preserved verbatim so any server can be re-enabled at any time.
+// ---------------------------------------------------------------------------
+
+const MCP_ACTIVE_KEY: &str = "mcpServers";
+const MCP_DISABLED_KEY: &str = "mcpServersDisabled";
+const MCP_SCAN_MAX_DEPTH: usize = 3;
+
+#[derive(serde::Serialize, Clone)]
+struct McpServerEntry {
+    /// stable UI key: `<source>|<config path>|<server name>`
+    id: String,
+    /// server name inside `mcpServers`
+    name: String,
+    /// global | dsh | workspace
+    source: String,
+    /// workspace title (workspace scope only)
+    workspace: Option<String>,
+    /// absolute path of the `.mcp.json` holding this server
+    config: String,
+    /// resolved command ("npx", "node", "uvx", …)
+    command: String,
+    /// command argv (missing when the server uses streamable-http)
+    args: Vec<String>,
+    /// explicit env var names (values are never sent to the UI)
+    env_keys: Vec<String>,
+    /// whether the server is currently enabled
+    enabled: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct McpSourceFile {
+    path: String,
+    kind: String,
+    workspace: Option<String>,
+    servers: usize,
+    disabled: usize,
+}
+
+#[derive(serde::Serialize)]
+struct McpListResult {
+    files: Vec<McpSourceFile>,
+    servers: Vec<McpServerEntry>,
+}
+
+/// OS-home global config plus the DSH-home-level configs.
+fn mcp_home_files() -> Vec<(PathBuf, &'static str, Option<String>)> {
+    let mut out = Vec::new();
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let p = PathBuf::from(&profile).join(".mcp.json");
+        if p.is_file() {
+            out.push((p, "global", None));
+        }
+    }
+    let home = resolve_dsh_home();
+    for (p, kind) in [
+        (home.join(".mcp.json"), "dsh"),
+        (home.join("attachments").join(".mcp.json"), "dsh"),
+    ] {
+        if p.is_file() {
+            out.push((p, kind, None));
+        }
+    }
+    out
+}
+
+/// Recursively (bounded) collect `.mcp.json`/`mcp.json` files under a workspace,
+/// skipping noise directories so a casual `C:\` workspace stays fast.
+fn collect_mcp_files(
+    dir: &std::path::Path,
+    depth: usize,
+    title: Option<String>,
+    out: &mut Vec<(PathBuf, Option<String>)>,
+) {
+    for name in [".mcp.json", "mcp.json"] {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            out.push((candidate, title.clone()));
+        }
+    }
+    if depth >= MCP_SCAN_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if matches!(
+            name.as_str(),
+            "node_modules" | ".git" | "dist" | "target" | "build" | ".cache" | ".idea" | ".vscode"
+        ) {
+            continue;
+        }
+        if name.starts_with('.') {
+            continue;
+        }
+        collect_mcp_files(&entry.path(), depth + 1, title.clone(), out);
+    }
+}
+
+/// Every known workspace (from `~/.dsh/storages/workspace.json`) scanned for
+/// `.mcp.json` registries.
+fn mcp_workspace_files() -> Vec<(PathBuf, Option<String>)> {
+    let mut out = Vec::new();
+    let home = resolve_dsh_home();
+    let index_path = home.join("storages").join("workspace.json");
+    let Ok(index_text) = std::fs::read_to_string(&index_path) else {
+        return out;
+    };
+    let Ok(index) = serde_json::from_str::<serde_json::Value>(&index_text) else {
+        return out;
+    };
+    let Some(workspaces) = index.pointer("/tables/workspaces").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for workspace in workspaces.values() {
+        let Some(path) = workspace.get("path").and_then(|v| v.as_str()).map(PathBuf::from) else {
+            continue;
+        };
+        // Skip drive roots (`C:\`): scanning them would walk the whole disk and
+        // only mirror the global registry back under the workspace bucket.
+        if path.file_name().is_none() || !path.is_dir() {
+            continue;
+        }
+        let title = workspace
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .filter(|t| !t.is_empty());
+        collect_mcp_files(&path, 0, title, &mut out);
+    }
+    out
+}
+
+/// Parse one `.mcp.json`: returns the server entries (both buckets) and the
+/// number of currently-disabled servers.
+fn mcp_read_config(
+    path: &std::path::Path,
+    kind: &str,
+    workspace: Option<String>,
+) -> (Vec<McpServerEntry>, usize) {
+    let mut entries = Vec::new();
+    let Ok(value) = read_json(path) else {
+        return (entries, 0);
+    };
+    let Some(root) = value.as_object() else {
+        return (entries, 0);
+    };
+    let active_ref = root.get(MCP_ACTIVE_KEY).and_then(|v| v.as_object());
+    let disabled_ref = root.get(MCP_DISABLED_KEY).and_then(|v| v.as_object());
+    let empty_map = serde_json::Map::new();
+    let active = active_ref.unwrap_or(&empty_map);
+    let disabled = disabled_ref.unwrap_or(&empty_map);
+    let config = path.display().to_string();
+    let mut push = |name: &str, def: &serde_json::Value, enabled: bool| {
+        let command = def
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let args = def
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let env_keys = def
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|map| map.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        entries.push(McpServerEntry {
+            id: format!("{kind}|{config}|{name}"),
+            name: name.to_string(),
+            source: kind.to_string(),
+            workspace: workspace.clone(),
+            config: config.clone(),
+            command,
+            args,
+            env_keys,
+            enabled,
+        });
+    };
+    for (name, def) in active {
+        push(name, def, true);
+    }
+    for (name, def) in disabled {
+        push(name, def, false);
+    }
+    (entries, disabled.len())
+}
+
+/// Scan the global, DSH-home and workspace registries and merge every server.
+#[tauri::command]
+fn mcp_list() -> McpListResult {
+    let mut files = Vec::new();
+    let mut servers = Vec::new();
+    for (path, kind, workspace) in mcp_home_files() {
+        let config = path.display().to_string();
+        let (list, disabled_count) = mcp_read_config(&path, kind, workspace.clone());
+        files.push(McpSourceFile {
+            path: config,
+            kind: kind.to_string(),
+            workspace,
+            servers: list.len(),
+            disabled: disabled_count,
+        });
+        servers.extend(list);
+    }
+    for (path, workspace) in mcp_workspace_files() {
+        let config = path.display().to_string();
+        let (list, disabled_count) = mcp_read_config(&path, "workspace", workspace.clone());
+        files.push(McpSourceFile {
+            path: config,
+            kind: "workspace".to_string(),
+            workspace,
+            servers: list.len(),
+            disabled: disabled_count,
+        });
+        servers.extend(list);
+    }
+    McpListResult { files, servers }
+}
+
+/// Enable/disable one MCP server by moving it between `mcpServers` and
+/// `mcpServersDisabled` inside its `.mcp.json`. The original definition is
+/// preserved, so nothing is lost when the user flips a switch.
+#[tauri::command]
+fn mcp_set_enabled(config: String, name: String, enabled: bool) -> Result<serde_json::Value, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("MCP server name is empty".to_string());
+    }
+    let path = PathBuf::from(&config);
+    let mut value = read_json(&path)?;
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| format!("not a JSON object: {}", path.display()))?;
+
+    let mut active: serde_json::Map<String, serde_json::Value> = root
+        .get(MCP_ACTIVE_KEY)
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut disabled: serde_json::Map<String, serde_json::Value> = root
+        .get(MCP_DISABLED_KEY)
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    if enabled {
+        match disabled.remove(&name) {
+            Some(def) => {
+                active.insert(name.clone(), def);
+            }
+            None => {
+                if !active.contains_key(&name) {
+                    return Err(format!(
+                        "MCP server \"{name}\" is not present in {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    } else {
+        match active.remove(&name) {
+            Some(def) => {
+                disabled.insert(name.clone(), def);
+            }
+            None => {
+                return Err(format!(
+                    "MCP server \"{name}\" is not present or already disabled in {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    root.insert(MCP_ACTIVE_KEY.to_string(), serde_json::Value::Object(active));
+    root.insert(MCP_DISABLED_KEY.to_string(), serde_json::Value::Object(disabled));
+    write_json(&path, &value)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "config": config,
+        "name": name,
+        "enabled": enabled,
+    }))
+}
+
+
+// ---------------------------------------------------------------------------
 // entry
 // ---------------------------------------------------------------------------
 
@@ -1875,7 +2182,7 @@ pub fn run() {
             show_main(app);
         }))
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![boot_state, retry_boot, reveal_logs, stage_attachments, plugin_list, plugin_manage, plugin_set_enabled])
+        .invoke_handler(tauri::generate_handler![boot_state, retry_boot, reveal_logs, stage_attachments, plugin_list, plugin_manage, plugin_set_enabled, mcp_list, mcp_set_enabled])
         .setup(|app| {
             let handle = app.handle().clone();
             build_tray(&handle)?;

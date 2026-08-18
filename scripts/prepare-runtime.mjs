@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
+import { applySessionStats } from "./apply-session-stats.mjs";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -213,5 +214,6 @@ function ensurePnpm() {
 syncDistFonts();
 ensureNode();
 installRuntime();
+applySessionStats();
 ensurePnpm();
 console.log("[prepare-runtime] done");

@@ -1,0 +1,27 @@
+{
+  "name": "@dsh-desktop/session-stats",
+  "version": "0.1.0",
+  "description": "DSH Desktop session telemetry: whole-log thinking/tool wall-time projection plus a live statistics panel for the selected session.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "zod": "^4.4.3",
+    "@deepseek-ai/dsh-launch-environment": "^0.1.0-rc.6"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "license": "MIT"
+}

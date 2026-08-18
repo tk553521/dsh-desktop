@@ -40,6 +40,9 @@ const ICONS = {
   puzzle:
     '<path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/>',
   plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  plug: '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
+  chevronDown: '<path d="m6 9 6 6 6-6"/>',
+  refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
   trash:
     '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
   restart:
@@ -290,6 +293,7 @@ function buildTitlebar() {
       <span class="dsh-tb-title">DeepSeek Harness</span>
       <span class="dsh-tb-dot"></span>
     </div>
+    <button class="dsh-tb-btn dsh-tb-mcp" title="MCP 管理" aria-label="MCP servers">${lucide("plug", 13, 1.8)}<span class="dsh-tb-mcp-badge" id="dsh-tb-mcp-badge"></span></button>
     <button class="dsh-tb-btn dsh-tb-plug" title="Plugins" aria-label="Plugins">${lucide("puzzle")}</button>
     <button class="dsh-tb-btn dsh-tb-min" title="Minimize" aria-label="Minimize">${lucide("minus")}</button>
     <button class="dsh-tb-btn dsh-tb-max" title="Maximize" aria-label="Maximize">${lucide("square")}</button>
@@ -297,6 +301,7 @@ function buildTitlebar() {
 
   document.body.appendChild(bar);
   buildPluginPanel();
+  buildMcpPanel();
 
   const minBtn = bar.querySelector(".dsh-tb-min");
   const maxBtn = bar.querySelector(".dsh-tb-max");
@@ -644,10 +649,244 @@ function buildPluginPanel() {
   const plugBtn = document.querySelector("#dsh-titlebar .dsh-tb-plug");
   if (plugBtn) {
     plugBtn.addEventListener("click", () => {
-      panel.classList.toggle("dsh-hidden");
-      if (!panel.classList.contains("dsh-hidden")) refresh();
+      // Only one floating panel at a time: opening Plugins closes MCP.
+      closeMcpPanel();
+      const opening = panel.classList.contains("dsh-hidden");
+      panel.classList.toggle("dsh-hidden", !opening);
+      plugBtn.classList.toggle("active", opening);
+      if (opening) refresh();
     });
   }
+}
+
+// ---- MCP management：标题栏 Plugins 左侧按钮 + 右上角玻璃面板 --------------
+// The desktop shell scans the Claude-Code-style `.mcp.json` registries it can
+// reach (global `~/.mcp.json`, DSH home and every known workspace) and merges
+// them into a management panel (`mcp_list`), with per-server enable/disable
+// toggles (`mcp_set_enabled`). A floating titlebar button sits right before
+// the Plugins button and opens a top-right glass panel styled exactly like the
+// plugin manager.
+function mcpInvokeAvailable() {
+  return !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
+}
+
+function closeMcpPanel() {
+  const panel = document.getElementById("dsh-mcp-bar");
+  if (panel) panel.classList.add("dsh-hidden");
+  const btn = document.querySelector("#dsh-titlebar .dsh-tb-mcp");
+  if (btn) {
+    btn.classList.remove("active");
+    btn.setAttribute("aria-expanded", "false");
+  }
+}
+
+function closePluginPanel() {
+  const panel = document.getElementById("dsh-plugin-panel");
+  if (panel) panel.classList.add("dsh-hidden");
+  const btn = document.querySelector("#dsh-titlebar .dsh-tb-plug");
+  if (btn) btn.classList.remove("active");
+}
+
+function buildMcpPanel() {
+  if (document.getElementById("dsh-mcp-bar")) return;
+  if (!document.body) {
+    setTimeout(buildMcpPanel, 50);
+    return;
+  }
+  const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
+
+  const panel = document.createElement("div");
+  panel.id = "dsh-mcp-bar";
+  panel.className = "dsh-hidden";
+
+  panel.innerHTML = `
+    <div class="dsh-mcp-head">
+      <span class="dsh-mcp-title">${lucide("plug", 13, 1.8)} <b>MCP 管理</b></span>
+      <span class="dsh-mcp-count" id="dsh-mcp-count"></span>
+      <span class="dsh-mcp-summary" id="dsh-mcp-summary"></span>
+      <button type="button" class="dsh-tb-btn dsh-mcp-refresh" title="Rescan MCP configurations" aria-label="Rescan MCP configurations">${lucide("refresh", 13, 1.8)}</button>
+      <button type="button" class="dsh-tb-btn dsh-mcp-close" title="Close MCP management" aria-label="Close MCP management">${lucide("close", 13, 1.8)}</button>
+    </div>
+    <div class="dsh-mcp-body" id="dsh-mcp-body"></div>`;
+
+  document.body.appendChild(panel);
+
+  const body = panel.querySelector("#dsh-mcp-body");
+  const count = panel.querySelector("#dsh-mcp-count");
+  const summary = panel.querySelector("#dsh-mcp-summary");
+  const mcpBtn = document.querySelector("#dsh-titlebar .dsh-tb-mcp");
+  const badge = document.getElementById("dsh-tb-mcp-badge");
+
+  const setOpen = (open) => {
+    panel.classList.toggle("dsh-hidden", !open);
+    if (mcpBtn) {
+      mcpBtn.classList.toggle("active", open);
+      mcpBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+    if (open) refresh();
+  };
+
+  if (mcpBtn) {
+    mcpBtn.addEventListener("click", () => {
+      const opening = panel.classList.contains("dsh-hidden");
+      // Only one floating panel at a time: opening MCP closes Plugins.
+      closePluginPanel();
+      setOpen(opening);
+    });
+  }
+  panel.querySelector(".dsh-mcp-close").addEventListener("click", () => setOpen(false));
+  panel.querySelector(".dsh-mcp-refresh").addEventListener("click", refresh);
+
+  // Esc or clicking anywhere outside closes the panel.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") setOpen(false);
+  });
+  document.addEventListener("click", (e) => {
+    if (panel.classList.contains("dsh-hidden")) return;
+    if (e.target instanceof Element &&
+        (e.target.closest("#dsh-mcp-bar") || e.target.closest("#dsh-titlebar .dsh-tb-mcp"))) return;
+    setOpen(false);
+  });
+
+  function setBusy(busy) {
+    const refreshBtn = panel.querySelector(".dsh-mcp-refresh");
+    if (refreshBtn) refreshBtn.disabled = busy;
+  }
+
+  function makeRow(server) {
+    const row = document.createElement("div");
+    row.className = "dsh-mcp-row";
+    row.title = server.config;
+
+    const label = document.createElement("span");
+    label.className = "dsh-mcp-name";
+    label.textContent = server.name || "?";
+    label.title = server.config;
+
+    const meta = document.createElement("span");
+    meta.className = "dsh-mcp-meta";
+    const cmdParts = [server.command || "", ...(server.args || []).slice(0, 3)];
+    meta.textContent = cmdParts.join(" ").trim() || (server.env_keys && server.env_keys.length ? "env: " + server.env_keys.join(", ") : "remote / http");
+    meta.title = meta.textContent;
+
+    const scope = document.createElement("span");
+    scope.className = "dsh-mcp-scope";
+    const scopeText =
+      server.source === "global" ? "global"
+      : server.source === "dsh" ? "dsh-home"
+      : server.workspace || "workspace";
+    scope.textContent = scopeText;
+    scope.title = server.config;
+    scope.classList.add("dsh-mcp-scope-" + (server.source === "global" ? "global" : server.source === "dsh" ? "dsh" : "ws"));
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "dsh-mcp-switch" + (server.enabled ? " dsh-mcp-switch-on" : "");
+    toggle.setAttribute("role", "switch");
+    toggle.setAttribute("aria-checked", server.enabled ? "true" : "false");
+    toggle.title = server.enabled ? "Disable this MCP server" : "Enable this MCP server";
+    toggle.innerHTML = `<span class="dsh-mcp-switch-knob"></span>`;
+
+    const config = server.config;
+    const serverName = server.name;
+    const serverEnabled = server.enabled;
+    toggle.addEventListener("click", async () => {
+      toggle.disabled = true;
+      try {
+        await invoke("mcp_set_enabled", { config, name: serverName, enabled: !serverEnabled });
+        await refresh();
+      } catch (error) {
+        summary.textContent = String((error && error.message) || error || "toggle failed");
+        timeoutShowSummary();
+        toggle.disabled = false;
+      }
+    });
+
+    const details = document.createElement("span");
+    details.className = "dsh-mcp-details";
+    const parts = [];
+    if (server.env_keys && server.env_keys.length) parts.push("env: " + server.env_keys.join(", "));
+    details.textContent = parts.length ? parts.join(" · ") : server.config;
+
+    row.appendChild(label);
+    row.appendChild(meta);
+    row.appendChild(scope);
+    row.appendChild(details);
+    row.appendChild(toggle);
+    return row;
+  }
+
+  let summaryTimer = null;
+  function timeoutShowSummary() {
+    if (summaryTimer) clearTimeout(summaryTimer);
+    summaryTimer = setTimeout(() => refresh(), 2600);
+  }
+
+  function render(data) {
+    const servers = (data && Array.isArray(data.servers)) ? data.servers : [];
+    const enabled = servers.filter((s) => s.enabled).length;
+    const total = servers.length;
+    count.textContent = String(total);
+    summary.textContent = enabled + "/" + total + " on";
+    if (badge) badge.textContent = String(total);
+    if (badge) badge.title = total + " MCP servers";
+
+    body.innerHTML = "";
+    if (!total) {
+      const empty = document.createElement("div");
+      empty.className = "dsh-mcp-empty";
+      empty.textContent =
+        data && data.files && data.files.length
+          ? "No MCP servers configured in the scanned .mcp.json files."
+          : "No .mcp.json registries found — scanned global, DSH home and workspaces.";
+      body.appendChild(empty);
+      return;
+    }
+
+    const sections = [
+      { key: "global", label: "Global" },
+      { key: "dsh", label: "DSH home" },
+      { key: "workspace", label: "Workspaces" },
+    ];
+    let anyRow = false;
+    for (const section of sections) {
+      const group = servers.filter((s) => s.source === section.key);
+      if (!group.length) continue;
+      anyRow = true;
+      const head = document.createElement("div");
+      head.className = "dsh-mcp-section";
+      const on = group.filter((s) => s.enabled).length;
+      head.textContent = section.label + " · " + on + "/" + group.length;
+      body.appendChild(head);
+      for (const server of group) body.appendChild(makeRow(server));
+    }
+    if (!anyRow) {
+      const empty = document.createElement("div");
+      empty.className = "dsh-mcp-empty";
+      empty.textContent = "No MCP servers found — none of the scanned .mcp.json files define mcpServers.";
+      body.appendChild(empty);
+    }
+  }
+
+  async function refresh() {
+    if (!mcpInvokeAvailable()) {
+      count.textContent = "—";
+      summary.textContent = "ipc unavailable";
+      return;
+    }
+    setBusy(true);
+    try {
+      render(await invoke("mcp_list"));
+    } catch (error) {
+      summary.textContent = String((error && error.message) || error || "mcp_list failed");
+      count.textContent = "!";
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Prime the badge count even before the user opens the panel.
+  refresh();
 }
 
 // ---- file drop → stage attachments → insert paths into the composer ---------

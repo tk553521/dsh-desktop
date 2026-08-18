@@ -22,7 +22,9 @@
     "allow-stage-attachments",
     "allow-plugin-list",
     "allow-plugin-manage",
-    "allow-plugin-set-enabled"
+    "allow-plugin-set-enabled",
+    "allow-mcp-list",
+    "allow-mcp-set-enabled"
   ],
   "remote": {
     "urls": [

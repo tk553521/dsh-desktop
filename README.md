@@ -30,7 +30,10 @@ skin/
   skin.css                完整的 --dsw-* token 重映射 + 字体 + 窗口样式
   skin.js                 极光画布、噪点、标题栏、IPC 接线
   fonts/                  Space Grotesk / Inter 可变字体 woff2
+plugins/
+  session-stats/          会话统计插件（host 投影 + browser 面板）
 scripts/
+  apply-session-stats.mjs 把会话统计插件注入内置运行时依赖树和 bundle patch
   build-skin.mjs          把皮肤 + 字体打包成 src-tauri/scripts/init.js
   fetch-fonts.mjs         下载可变字体
   gen-icon.mjs            logo.svg -> app-icon.png（通过内置 sharp）
@@ -48,6 +51,37 @@ scripts/
 ## 皮肤
 
 Harness 界面通过 `--dsw-static-*` / `--dsw-alias-*` CSS 变量做了完整的 token 化；`skin.css` 把整套 token 重映射为「黑曜石 + 极光」配色（半透明表面叠加 WebGL 极光画布、噪点、胶片暗角），用内嵌可变字体覆盖排版，并加了一个悬浮玻璃窗口控制胶囊，图标全部使用 Lucide 线性图标（无任何 emoji）。
+
+## 会话统计
+
+会话页底部（输入框 dock）内建一块实时统计卡片，自动跟随当前选中的会话：
+
+- **模型思考时间 / 工具调用时间**：整份会话日志的投影值（不受分页和压缩影响），进行中的步骤与工具调用按 1s 节拍实时跳动。
+- **思考 / 工具时间占比**：渐变堆叠条 + 图例百分比。
+- **耗时最久的工具调用**：工具名、入参、实际耗时与完整返回值（可展开）。
+- 轮次、步数、平均首 token 延迟、token 吞吐等辅助指标。
+- **DeepSeek 余额**：通过官方 `/user/balance` 接口实时查询（未配置 `DEEPSEEK_API_KEY` 时给出提示），带手动刷新。
+- **峰谷时段提示**：当前为峰时/谷时（按本地时段，覆盖 DeepSeek 分时计价的谷时窗口 00:30–08:30）。
+- **本次会话用量**：输入 / 输出 / 缓存 tokens 汇总。
+- **每轮对话用量**：逐轮输入 / 输出 / 缓存 tokens 明细列表。
+- 面板默认折叠，只显示一行实时摘要；点击标题栏可展开/收起完整统计。
+
+实现为 Cordis 双面插件 `@dsh-desktop/session-stats`：host 半区注册 `sessionToolDetail` 会话投影（整份日志折叠出最长工具调用和 live 状态），browser 半区注册 `conversation.composer.dock` 卡片。`scripts/prepare-runtime.mjs` 会在每次 `npm ci` 后把它复制进内置运行时并插入 `dsh-web-app` bundle patch，因此是开箱即用的内置能力。
+
+## MCP 管理
+
+悬浮标题栏上、**Plugins 按钮左侧**内建一个 **MCP 按钮**（带数量角标），点击弹出与插件管理器同款的右上角玻璃面板，自动在工作区与全局查找可用的 MCP 配置并汇总成管理列表，每条带一个启用/禁用开关：
+
+- **扫描范围**：全局 `~/.mcp.json`、DSH home（`~/.dsh/.mcp.json`、`~/.dsh/attachments/.mcp.json`），以及
+  `storages/workspace.json` 记录的每个工作区目录（递归浅扫 `.mcp.json` / `mcp.json`，跳过 `node_modules`、`.git`、`dist` 等噪声目录）。
+- **列表分组**：Global / DSH home / Workspaces 三组，显示服务器名、启动命令（`command` + `args` 摘要）与环境变量名（不泄露值）。
+- **启用/禁用**：把服务在 `.mcp.json` 的 `mcpServers` 与 `mcpServersDisabled` 两个对象之间移动，原始定义原样保留、随时可还原；
+  点击开关即时改写文件并刷新列表。
+- **交互**：MCP 按钮与 Plugins 按钮互斥（同一次只开一个面板）、`Esc` / 点击空白处关闭、面板右上角刷新按钮随时重扫；所有文件读写都走 Tauri IPC（`mcp_list` / `mcp_set_enabled`），WebView 半区只渲染。
+- **样式**：面板复用 `dsp-*` 玻璃卡片风格（`top:64px; right:14px`），与插件管理器一致；标题栏按钮沿用 `.dsh-tb-btn` 主题并带数量角标。
+
+实现为皮肤内建模块（`skin/skin.js` + `skin/skin.css`，见 `scripts/build-skin.mjs`）：宿主 Rust 负责扫描与改写 JSON 配置，前端 `#dsh-mcp-bar`
+（右上角面板）由标题栏 `.dsh-tb-mcp` 按钮开合。
 
 ## 插件架构（Cordis）
 

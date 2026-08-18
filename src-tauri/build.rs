@@ -11,6 +11,8 @@ fn main() {
                 "plugin_list",
                 "plugin_manage",
                 "plugin_set_enabled",
+                "mcp_list",
+                "mcp_set_enabled",
             ]),
         ),
     )
