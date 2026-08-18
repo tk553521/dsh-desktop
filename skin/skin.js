@@ -51,6 +51,11 @@ const ICONS = {
     '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>',
   folder:
     '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  terminal: '<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  copy: '<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+  pause: '<rect width="4" height="16" x="6" y="4" rx="1"/><rect width="4" height="16" x="14" y="4" rx="1"/>',
+  play: '<polygon points="6 3 20 12 6 21 6 3"/>',
 };
 
 const WHALE_PATH = "M48.8354 10.0479C48.3232 9.79199 48.1025 10.2798 47.8032 10.5278C47.7007 10.6079 47.6143 10.7119 47.5273 10.8076C46.7793 11.624 45.9048 12.1597 44.7622 12.0957C43.0923 12 41.666 12.5356 40.4058 13.8398C40.1377 12.2319 39.2476 11.272 37.8926 10.6558C37.1836 10.3359 36.4668 10.0156 35.9702 9.31982C35.6235 8.82373 35.5293 8.27197 35.356 7.72754C35.2456 7.3999 35.1353 7.06396 34.7651 7.00781C34.3633 6.94385 34.2056 7.2876 34.0479 7.57568C33.418 8.75195 33.1733 10.0479 33.1973 11.3599C33.2524 14.312 34.4736 16.6641 36.8999 18.3359C37.1758 18.5278 37.2466 18.7197 37.1597 19C36.9946 19.5757 36.7974 20.1357 36.624 20.7119C36.5137 21.0801 36.3486 21.1597 35.9624 21C34.6309 20.4321 33.481 19.5918 32.4644 18.5757C30.7393 16.8721 29.1792 14.9917 27.2334 13.52C26.7764 13.1758 26.3193 12.856 25.8467 12.5518C23.8618 10.584 26.1069 8.96777 26.627 8.77588C27.1704 8.57568 26.8159 7.8877 25.0591 7.896C23.3022 7.90381 21.6953 8.50391 19.647 9.30371C19.3477 9.42383 19.0322 9.51172 18.7095 9.58398C16.8501 9.22363 14.9199 9.14355 12.9033 9.37598C9.10596 9.80762 6.07275 11.6396 3.84326 14.7681C1.16455 18.5278 0.53418 22.7998 1.30664 27.2559C2.11768 31.9521 4.46582 35.8398 8.07373 38.8799C11.8159 42.0322 16.1255 43.5762 21.041 43.2803C24.0269 43.104 27.3516 42.6963 31.1016 39.4561C32.0469 39.936 33.0396 40.1279 34.686 40.272C35.9546 40.3921 37.1758 40.208 38.1211 40.0078C39.6021 39.688 39.4995 38.2881 38.9639 38.0322C34.623 35.9678 35.5762 36.8081 34.71 36.1279C36.9155 33.4639 40.2402 30.6958 41.54 21.728C41.6426 21.0161 41.5557 20.5679 41.54 19.9917C41.5322 19.6396 41.6108 19.5039 42.0049 19.4639C43.0923 19.3359 44.1479 19.0317 45.1167 18.4878C47.9292 16.9199 49.064 14.3438 49.3315 11.2559C49.3711 10.7837 49.3237 10.2959 48.8354 10.0479ZM24.3262 37.8398C20.1196 34.4639 18.0791 33.3521 17.2358 33.3999C16.4482 33.4482 16.5898 34.3682 16.7632 34.9678C16.9443 35.5601 17.1812 35.9683 17.5117 36.4878C17.7402 36.832 17.8979 37.3442 17.2832 37.728C15.9282 38.584 13.5728 37.4399 13.4624 37.3838C10.7207 35.7358 8.42822 33.5601 6.81348 30.584C5.25342 27.7197 4.34766 24.6479 4.19775 21.3677C4.1582 20.5757 4.38672 20.2959 5.15869 20.1519C6.17529 19.96 7.22314 19.9199 8.23926 20.0718C12.5327 20.7119 16.1885 22.6719 19.2529 25.7759C21.002 27.5439 22.3252 29.6558 23.6885 31.7202C25.1377 33.9121 26.6978 36 28.6831 37.7119C29.3843 38.312 29.9434 38.7681 30.479 39.104C28.8643 39.2881 26.1699 39.3281 24.3262 37.8398ZM26.3433 24.6001C26.3433 24.248 26.6191 23.9678 26.9658 23.9678C27.0444 23.9678 27.1152 23.9839 27.1782 24.0078C27.2651 24.04 27.3438 24.0879 27.4067 24.1602C27.5171 24.272 27.5801 24.4321 27.5801 24.6001C27.5801 24.9521 27.3042 25.2319 26.9575 25.2319C26.6108 25.2319 26.3433 24.9521 26.3433 24.6001ZM32.6064 27.8799C32.2046 28.0479 31.8027 28.1919 31.4165 28.208C30.8179 28.2397 30.1641 27.9922 29.8096 27.688C29.2583 27.2158 28.8643 26.9521 28.6987 26.1279C28.6279 25.7759 28.6675 25.2319 28.7305 24.9199C28.8721 24.248 28.7144 23.8159 28.2495 23.4238C27.8716 23.104 27.3911 23.0161 26.8633 23.0161C26.666 23.0161 26.4849 22.9277 26.3511 22.856C26.1304 22.7441 25.9492 22.4639 26.1226 22.1201C26.1777 22.0078 26.4458 21.7358 26.5088 21.688C27.2256 21.272 28.0527 21.4077 28.8169 21.7197C29.5259 22.0161 30.0615 22.5601 30.834 23.3281C31.6216 24.2559 31.7632 24.5117 32.2124 25.208C32.5669 25.752 32.8901 26.312 33.1104 26.9521C33.2446 27.3521 33.0713 27.6802 32.6064 27.8799Z";
@@ -295,6 +300,7 @@ function buildTitlebar() {
     </div>
     <button class="dsh-tb-btn dsh-tb-mcp" title="MCP 管理" aria-label="MCP servers">${lucide("plug", 13, 1.8)}<span class="dsh-tb-mcp-badge" id="dsh-tb-mcp-badge"></span></button>
     <button class="dsh-tb-btn dsh-tb-plug" title="Plugins" aria-label="Plugins">${lucide("puzzle")}</button>
+    <button class="dsh-tb-btn dsh-tb-log" title="Runtime logs" aria-label="Runtime logs">${lucide("terminal")}</button>
     <button class="dsh-tb-btn dsh-tb-min" title="Minimize" aria-label="Minimize">${lucide("minus")}</button>
     <button class="dsh-tb-btn dsh-tb-max" title="Maximize" aria-label="Maximize">${lucide("square")}</button>
     <button class="dsh-tb-btn dsh-tb-close" title="Close to tray" aria-label="Close">${lucide("close")}</button>`;
@@ -302,6 +308,8 @@ function buildTitlebar() {
   document.body.appendChild(bar);
   buildPluginPanel();
   buildMcpPanel();
+
+  buildLogPanel();
 
   const minBtn = bar.querySelector(".dsh-tb-min");
   const maxBtn = bar.querySelector(".dsh-tb-max");
@@ -408,6 +416,10 @@ function buildPluginPanel() {
   const list = panel.querySelector("#dsp-list");
   const log = panel.querySelector("#dsp-log");
   const input = panel.querySelector("#dsp-input");
+
+  const shellLog = (level, message) => {
+    if (window.__dshShellLog) window.__dshShellLog(level, "plugin", message);
+  };
 
   const logLine = (text, kind) => {
     const line = document.createElement("div");
@@ -572,11 +584,13 @@ function buildPluginPanel() {
     if (!invoke || pluginBusy) return;
     pluginBusy = true;
     logLine(`> ${enabled ? "enable" : "disable"} ${name}`, "cmd");
+    shellLog("info", `> ${enabled ? "enable" : "disable"} ${name}`);
     try {
       const result = await invoke("plugin_set_enabled", { name, enabled });
       const message = (result && result.message) || String(result || "");
       if (message.trim()) logLine(message.trim(), "out");
       logLine(`${name} ${enabled ? "enabled" : "disabled"} — hot-applied by cordis HMR`, "ok");
+      shellLog("info", `${name} ${enabled ? "enabled" : "disabled"} — hot-applied by cordis HMR`);
       if (result && result.reload) {
         const ready = await reloadClient([name], enabled);
         if (!ready) await refresh();
@@ -585,6 +599,7 @@ function buildPluginPanel() {
       }
     } catch (error) {
       logLine(String(error), "err");
+      shellLog("error", `toggle ${name}: ${error}`);
     } finally {
       pluginBusy = false;
     }
@@ -594,6 +609,7 @@ function buildPluginPanel() {
     if (!invoke || pluginBusy) return;
     pluginBusy = true;
     logLine(`> ${action} ${name}`, "cmd");
+    shellLog("info", `> ${action} ${name}`);
     input.disabled = true;
     const addBtn = panel.querySelector(".dsp-add");
     if (addBtn) addBtn.disabled = true;
@@ -602,6 +618,7 @@ function buildPluginPanel() {
       const output = (result && result.output) || String(result || "");
       if (output.trim()) logLine(output.trim(), "out");
       logLine(`${action} ${name} — done`, "ok");
+      shellLog("info", `${action} ${name} — done`);
       if (action === "add") {
         logLine("hot-loaded through cordis HMR — no restart needed", "warn");
         input.value = "";
@@ -614,6 +631,7 @@ function buildPluginPanel() {
       }
     } catch (error) {
       logLine(String(error), "err");
+      shellLog("error", `${action} ${name}: ${error}`);
       await refresh();
     } finally {
       pluginBusy = false;
@@ -638,10 +656,12 @@ function buildPluginPanel() {
   panel.querySelector(".dsp-restart").addEventListener("click", async () => {
     if (!invoke) return;
     logLine("restarting harness", "cmd");
+    shellLog("warn", "restarting harness from the plugin panel");
     try {
       await invoke("retry_boot");
     } catch (error) {
       logLine(String(error), "err");
+      shellLog("error", `restart harness: ${error}`);
     }
   });
   refresh();
@@ -649,8 +669,9 @@ function buildPluginPanel() {
   const plugBtn = document.querySelector("#dsh-titlebar .dsh-tb-plug");
   if (plugBtn) {
     plugBtn.addEventListener("click", () => {
-      // Only one floating panel at a time: opening Plugins closes MCP.
+      // Only one floating panel at a time: opening Plugins closes MCP/Log panels.
       closeMcpPanel();
+      if (window.__dshSetLogPanelVisible) window.__dshSetLogPanelVisible(false);
       const opening = panel.classList.contains("dsh-hidden");
       panel.classList.toggle("dsh-hidden", !opening);
       plugBtn.classList.toggle("active", opening);
@@ -729,8 +750,9 @@ function buildMcpPanel() {
   if (mcpBtn) {
     mcpBtn.addEventListener("click", () => {
       const opening = panel.classList.contains("dsh-hidden");
-      // Only one floating panel at a time: opening MCP closes Plugins.
+      // Only one floating panel at a time: opening MCP closes Plugins/Log.
       closePluginPanel();
+      if (window.__dshSetLogPanelVisible) window.__dshSetLogPanelVisible(false);
       setOpen(opening);
     });
   }
@@ -889,7 +911,430 @@ function buildMcpPanel() {
   refresh();
 }
 
-// ---- file drop → stage attachments → insert paths into the composer ---------
+// ---- runtime log console (structured search / filter / live tail) ----------
+function buildLogPanel() {
+  if (document.getElementById("dsh-log-panel")) return;
+
+  const tauri = window.__TAURI__;
+  const invoke =
+    tauri && tauri.core
+      ? (cmd, args) => tauri.core.invoke(cmd, args)
+      : null;
+  const listen = tauri && tauri.event ? tauri.event.listen : null;
+
+  const FALLBACK_META = {
+    levels: ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"],
+    modules: ["app", "boot", "harness", "plugin", "window", "tray", "attachment", "ipc", "logger"],
+    kinds: ["lifecycle", "state", "network", "process", "file", "ipc", "command", "ui", "performance", "diagnostic", "stdout", "stderr"],
+  };
+
+  const panel = document.createElement("div");
+  panel.id = "dsh-log-panel";
+  panel.className = "dsh-hidden";
+  panel.innerHTML = `
+    <div class="dsl-head">
+      <span class="dsl-title">${lucide("terminal", 13)} <b>Runtime Log</b></span>
+      <span class="dsl-headnote" id="dsl-headnote">jsonl · ring buffer</span>
+      <button class="dsh-tb-btn dsl-pause" id="dsl-pause" title="Pause live tail" aria-label="Pause live tail">${lucide("pause")}</button>
+      <button class="dsh-tb-btn dsl-copy" id="dsl-copy" title="Copy visible logs" aria-label="Copy visible logs">${lucide("copy")}</button>
+      <button class="dsh-tb-btn dsl-folder" id="dsl-folder" title="Open log folder" aria-label="Open log folder">${lucide("folder")}</button>
+      <button class="dsh-tb-btn dsl-close" title="Close" aria-label="Close">${lucide("close")}</button>
+    </div>
+    <div class="dsl-search">
+      <span class="dsl-search-icon">${lucide("search")}</span>
+      <input id="dsl-search" spellcheck="false" autocomplete="off"
+        placeholder="Search everything — message, module, type, level, timestamp…" />
+      <button class="dsl-search-clear dsh-hidden" id="dsl-search-clear" title="Clear search" aria-label="Clear search">${lucide("close")}</button>
+    </div>
+    <div class="dsl-facets">
+      <div class="dsl-facet-row">
+        <span class="dsl-facet-label">level</span>
+        <div class="dsl-chips" id="dsl-levels"></div>
+      </div>
+      <div class="dsl-facet-row">
+        <span class="dsl-facet-label">module</span>
+        <div class="dsl-chips" id="dsl-modules"></div>
+      </div>
+      <div class="dsl-facet-row">
+        <span class="dsl-facet-label">type</span>
+        <div class="dsl-chips" id="dsl-kinds"></div>
+      </div>
+    </div>
+    <div class="dsl-list" id="dsl-list">
+      <div class="dsl-empty">opening the live log…</div>
+    </div>
+    <div class="dsl-foot">
+      <span class="dsl-summary" id="dsl-summary">not connected</span>
+      <button class="dsl-more" id="dsl-more" disabled>Load older</button>
+      <span class="dsl-live" id="dsl-live">LIVE</span>
+    </div>`;
+  document.body.appendChild(panel);
+
+  const el = {
+    panel,
+    search: panel.querySelector("#dsl-search"),
+    searchClear: panel.querySelector("#dsl-search-clear"),
+    levels: panel.querySelector("#dsl-levels"),
+    modules: panel.querySelector("#dsl-modules"),
+    kinds: panel.querySelector("#dsl-kinds"),
+    list: panel.querySelector("#dsl-list"),
+    summary: panel.querySelector("#dsl-summary"),
+    more: panel.querySelector("#dsl-more"),
+    live: panel.querySelector("#dsl-live"),
+    pause: panel.querySelector("#dsl-pause"),
+    headnote: panel.querySelector("#dsl-headnote"),
+  };
+
+  const state = {
+    text: "",
+    levels: [],
+    modules: [],
+    kinds: [],
+    before: null,
+    entries: [],
+    page: null,
+    meta: null,
+    live: true,
+    visible: false,
+    follow: true,
+    timer: null,
+    metaTimer: null,
+  };
+
+  window.__dshShellLog = (level, module, message) => {
+    if (!invoke) return Promise.resolve();
+    return invoke("log_client", {
+      level: String(level || "info"),
+      module: String(module || "ui"),
+      message: String(message == null ? "" : message).slice(0, 16000),
+    }).catch(() => {});
+  };
+
+  const schedule = (ms = 160) => {
+    clearTimeout(state.timer);
+    state.timer = setTimeout(() => query(), ms);
+  };
+
+  const facetGroups = () => ({
+    levels: (state.meta && state.meta.levels) || FALLBACK_META.levels,
+    modules: (state.meta && state.meta.modules) || FALLBACK_META.modules,
+    kinds: (state.meta && state.meta.kinds) || FALLBACK_META.kinds,
+  });
+
+  const toggleFilter = (group, value) => {
+    const list = state[group];
+    const index = list.indexOf(value);
+    if (index >= 0) list.splice(index, 1);
+    else list.push(value);
+    state.before = null;
+    state.follow = true;
+    renderFacets();
+    schedule();
+  };
+
+  const renderFacets = () => {
+    const groups = facetGroups();
+    const targets = {
+      levels: el.levels,
+      modules: el.modules,
+      kinds: el.kinds,
+    };
+    for (const group of Object.keys(targets)) {
+      const target = targets[group];
+      target.innerHTML = "";
+      for (const value of groups[group]) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "dsl-chip";
+        chip.dataset.value = String(value).toLowerCase();
+        chip.classList.toggle("dsl-chip-on", state[group].indexOf(value) >= 0);
+        chip.innerHTML = `<span class="dsl-chip-dot"></span><span>${escapeHtml(String(value).toUpperCase())}</span>`;
+        chip.title = state[group].indexOf(value) >= 0 ? "Click to remove filter" : "Click to filter";
+        chip.addEventListener("click", () => toggleFilter(group, value));
+        target.appendChild(chip);
+      }
+    }
+  };
+
+  const highlight = (container, text) => {
+    const terms = state.text
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (!terms.length) {
+      container.textContent = text;
+      return;
+    }
+    const escaped = terms.map((term) =>
+      term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    );
+    const pattern = new RegExp(`(${escaped.join("|")})`, "gi");
+    for (const part of String(text).split(pattern)) {
+      if (!part) continue;
+      const hit = terms.indexOf(part.toLowerCase()) >= 0;
+      if (hit) {
+        const mark = document.createElement("mark");
+        mark.className = "dsl-mark";
+        mark.textContent = part;
+        container.appendChild(mark);
+      } else {
+        container.appendChild(document.createTextNode(part));
+      }
+    }
+  };
+
+  const renderEntry = (entry) => {
+    const row = document.createElement("div");
+    row.className = `dsl-row dsl-${String(entry.level || "info").toLowerCase()}`;
+    row.title = `${entry.ts || ""} · #${entry.seq || 0}\n${entry.message || ""}`;
+
+    const ts = document.createElement("span");
+    ts.className = "dsl-ts";
+    ts.textContent = entry.ts && entry.ts.length > 19 ? entry.ts.slice(5) : entry.ts || "";
+
+    const level = document.createElement("span");
+    level.className = "dsl-badge dsl-level";
+    level.textContent = entry.level || "INFO";
+
+    const module = document.createElement("span");
+    module.className = "dsl-badge dsl-module";
+    module.dataset.module = String(entry.module || "app").toLowerCase();
+    module.textContent = String(entry.module || "app").toUpperCase();
+
+    const kind = document.createElement("span");
+    kind.className = "dsl-badge dsl-kind";
+    kind.dataset.kind = String(entry.kind || "diagnostic").toLowerCase();
+    kind.textContent = String(entry.kind || "diagnostic").toUpperCase();
+
+    const msg = document.createElement("div");
+    msg.className = "dsl-msg";
+    highlight(msg, entry.message || "");
+
+    if (entry.context && typeof entry.context === "object" && Object.keys(entry.context).length) {
+      const details = document.createElement("details");
+      details.className = "dsl-context";
+      const summary = document.createElement("summary");
+      summary.textContent = "context";
+      const pre = document.createElement("pre");
+      pre.textContent = JSON.stringify(entry.context, null, 2);
+      details.appendChild(summary);
+      details.appendChild(pre);
+      msg.appendChild(details);
+    }
+
+    row.appendChild(ts);
+    row.appendChild(level);
+    row.appendChild(module);
+    row.appendChild(kind);
+    row.appendChild(msg);
+    return row;
+  };
+
+  const renderEntries = (append) => {
+    const list = el.list;
+    const oldHeight = list.scrollHeight;
+    const oldTop = list.scrollTop;
+    const fragment = document.createDocumentFragment();
+    for (const entry of state.entries) fragment.appendChild(renderEntry(entry));
+    list.innerHTML = "";
+    if (!state.entries.length) {
+      const empty = document.createElement("div");
+      empty.className = "dsl-empty";
+      empty.textContent = state.text || state.levels.length || state.modules.length || state.kinds.length
+        ? "no logs match these filters"
+        : "no logs yet — the shell starts writing as soon as it boots";
+      list.appendChild(empty);
+    } else {
+      list.appendChild(fragment);
+    }
+    if (append) {
+      list.scrollTop = oldTop + (list.scrollHeight - oldHeight);
+    } else if (state.follow) {
+      list.scrollTop = list.scrollHeight;
+    } else {
+      list.scrollTop = Math.min(oldTop, list.scrollHeight - list.clientHeight);
+    }
+  };
+
+  const updateChrome = () => {
+    const page = state.page;
+    const total = page ? page.totalMatches : 0;
+    const shown = state.entries.length;
+    const ring = page ? page.ringEntries : 0;
+    const capacity = page ? page.capacity : 0;
+    el.summary.textContent = `${total} matching · ${shown} shown · ring ${ring}/${capacity}`;
+    el.more.disabled = !page || !page.hasMore;
+    el.more.textContent = page && page.hasMore ? `Load older (next cursor #${page.before})` : "Load older";
+    el.live.classList.toggle("dsl-live-off", !state.live);
+    el.live.textContent = state.live ? "LIVE" : "PAUSED";
+    el.pause.innerHTML = lucide(state.live ? "pause" : "play");
+    el.pause.title = state.live ? "Pause live tail" : "Resume live tail";
+    if (state.meta && state.meta.file) {
+      el.headnote.textContent = `${state.meta.file.split(/[\\/]/).pop() || "log"} · seq #${state.meta.lastSeq || 0}`;
+    }
+  };
+
+  const query = async (append = false) => {
+    if (!invoke) {
+      el.summary.textContent = "tauri ipc unavailable";
+      el.list.innerHTML = '<div class="dsl-empty">tauri ipc unavailable</div>';
+      return;
+    }
+    try {
+      const page = await invoke("log_query", {
+        query: {
+          text: state.text,
+          levels: state.levels,
+          modules: state.modules,
+          kinds: state.kinds,
+          before: append ? state.before : null,
+          limit: 350,
+        },
+      });
+      state.page = page;
+      if (append && state.entries.length) {
+        const known = new Set(state.entries.map((entry) => entry.seq));
+        state.entries = page.entries
+          .filter((entry) => !known.has(entry.seq))
+          .concat(state.entries);
+      } else {
+        state.entries = page.entries || [];
+      }
+      state.before = page && page.hasMore ? page.before : null;
+      renderEntries(append);
+      updateChrome();
+    } catch (error) {
+      el.summary.textContent = `log_query failed: ${error}`;
+    }
+  };
+
+  const refreshMeta = async () => {
+    if (!invoke || !state.visible) return;
+    try {
+      state.meta = await invoke("log_meta");
+      renderFacets();
+      updateChrome();
+    } catch (_) {}
+  };
+
+  const openPanel = () => {
+    state.visible = true;
+    el.panel.classList.remove("dsh-hidden");
+    const logBtn = document.querySelector("#dsh-titlebar .dsh-tb-log");
+    if (logBtn) logBtn.classList.add("active");
+    const plugPanel = document.getElementById("dsh-plugin-panel");
+    if (plugPanel) plugPanel.classList.add("dsh-hidden");
+    const plugBtn = document.querySelector("#dsh-titlebar .dsh-tb-plug");
+    if (plugBtn) plugBtn.classList.remove("active");
+    closeMcpPanel();
+    state.follow = true;
+    state.before = null;
+    refreshMeta();
+    query();
+    if (listen && !window.__dsh_log_event_wired) {
+      window.__dsh_log_event_wired = true;
+      listen("log://entry", () => {
+        if (state.visible && state.live) schedule(140);
+      }).catch(() => {});
+    }
+  };
+
+  const closePanel = () => {
+    state.visible = false;
+    el.panel.classList.add("dsh-hidden");
+    const logBtn = document.querySelector("#dsh-titlebar .dsh-tb-log");
+    if (logBtn) logBtn.classList.remove("active");
+  };
+
+  // Let the plugin panel (or any other shell surface) close this panel while
+  // keeping its internal `visible` flag in sync with the DOM.
+  window.__dshSetLogPanelVisible = (visible) => {
+    if (visible) openPanel();
+    else closePanel();
+  };
+
+  const logBtn = document.querySelector("#dsh-titlebar .dsh-tb-log");
+  if (logBtn) {
+    logBtn.addEventListener("click", () => {
+      if (state.visible) closePanel();
+      else openPanel();
+    });
+  }
+  el.panel.querySelector(".dsl-close").addEventListener("click", closePanel);
+
+  el.search.addEventListener("input", () => {
+    state.text = el.search.value;
+    el.searchClear.classList.toggle("dsh-hidden", !state.text);
+    state.before = null;
+    state.follow = true;
+    schedule();
+  });
+  el.search.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.text) {
+      el.search.value = "";
+      state.text = "";
+      el.searchClear.classList.add("dsh-hidden");
+      state.before = null;
+      query();
+    }
+  });
+  el.searchClear.addEventListener("click", () => {
+    el.search.value = "";
+    state.text = "";
+    el.searchClear.classList.add("dsh-hidden");
+    state.before = null;
+    query();
+  });
+
+  el.more.addEventListener("click", () => {
+    if (state.before != null) query(true);
+  });
+
+  el.list.addEventListener("scroll", () => {
+    state.follow =
+      el.list.scrollTop + el.list.clientHeight + 24 >=
+      el.list.scrollHeight;
+  });
+
+  el.pause.addEventListener("click", () => {
+    state.live = !state.live;
+    updateChrome();
+    if (state.live) schedule(20);
+  });
+
+  el.panel.querySelector(".dsl-copy").addEventListener("click", async () => {
+    const text = state.entries
+      .map((entry) =>
+        `${entry.ts || ""} ${String(entry.level || "").padEnd(5)} [${entry.module}] [${entry.kind}] ${entry.message}`
+      )
+      .join("\n");
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const area = document.createElement("textarea");
+        area.value = text;
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand("copy");
+        area.remove();
+      }
+      el.panel.querySelector(".dsl-copy").title = `copied ${state.entries.length} line(s)`;
+    } catch (_) {
+      el.panel.querySelector(".dsl-copy").title = "clipboard unavailable";
+    }
+  });
+
+  el.panel.querySelector(".dsl-folder").addEventListener("click", () => {
+    if (invoke) invoke("reveal_logs").catch(() => {});
+  });
+
+  renderFacets();
+  updateChrome();
+
+  if (state.metaTimer) clearInterval(state.metaTimer);
+  state.metaTimer = setInterval(refreshMeta, 8000);
+}// ---- file drop → stage attachments → insert paths into the composer ---------
 // The desktop shell (via Tauri) intercepts OS file drops and emits
 // `tauri://drag-drop` with the real filesystem paths. We copy them into
 // ~/.dsh/attachments/ (Rust command `stage_attachments`) and drop the staged

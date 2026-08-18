@@ -13,6 +13,10 @@ fn main() {
                 "plugin_set_enabled",
                 "mcp_list",
                 "mcp_set_enabled",
+                "log_query",
+                "log_meta",
+                "log_clear",
+                "log_client",
             ]),
         ),
     )

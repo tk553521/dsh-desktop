@@ -7,12 +7,20 @@
 //! at the harness UI. Closing the main window hides it to the tray; quitting
 //! from the tray tears the child process tree down.
 
+mod logging;
+
+use logging::{
+    LogHub, LogLevel, LogMeta, LogPage, LogQuery, KIND_CHILD_STDOUT, KIND_COMMAND, KIND_DIAGNOSTIC,
+    KIND_FILE, KIND_IPC, KIND_LIFECYCLE, KIND_NETWORK, KIND_PERFORMANCE, KIND_PROCESS, KIND_STATE,
+    KIND_UI, MODULE_APP, MODULE_ATTACHMENT, MODULE_BOOT, MODULE_HARNESS, MODULE_LOGGER,
+    MODULE_PLUGIN, MODULE_TRAY, MODULE_WINDOW,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -52,17 +60,31 @@ struct BootState {
     log_tail: Option<String>,
 }
 
-#[derive(Default)]
 struct AppState {
     boot: Arc<Mutex<BootState>>,
     child: Arc<Mutex<Option<Child>>>,
     /// bumped on retry so a stale boot thread bails out
     generation: Arc<Mutex<u64>>,
+    /// structured runtime log hub (ring buffer + JSONL file + UI events)
+    logs: Arc<LogHub>,
     /// Windows job object: when the app dies for ANY reason, the OS kills the
     /// harness process tree (KILL_ON_JOB_CLOSE). Kept alive for the app's
     /// lifetime (raw handle as isize — HANDLE is not Send in windows 0.61).
     #[cfg(windows)]
     job: Arc<Mutex<Option<isize>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            boot: Arc::new(Mutex::new(BootState::default())),
+            child: Arc::new(Mutex::new(None)),
+            generation: Arc::new(Mutex::new(0)),
+            logs: Arc::new(LogHub::default()),
+            #[cfg(windows)]
+            job: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -71,8 +93,8 @@ fn assign_to_kill_job(child: &Child) -> Option<isize> {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     unsafe {
         let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?;
@@ -107,6 +129,16 @@ fn resolve_dsh_home() -> PathBuf {
     PathBuf::from(".dsh")
 }
 
+fn app_log_file(app: &AppHandle, name: &str) -> PathBuf {
+    match app.path().app_log_dir() {
+        Ok(dir) => {
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join(name)
+        }
+        Err(_) => std::env::temp_dir().join(format!("dsh-desktop-{name}")),
+    }
+}
+
 fn is_dsh_response(body: &str) -> bool {
     body.contains("__DSH_BOOT__")
 }
@@ -114,12 +146,8 @@ fn is_dsh_response(body: &str) -> bool {
 /// TCP-connect + minimal HTTP GET; returns the body when the port serves DSH.
 fn probe_dsh(port: u16) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .ok()?;
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).ok()?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -181,37 +209,75 @@ fn settings_ready(port: u16) -> bool {
 
 /// Wait up to `timeout` for the harness settings service on `port` to answer
 /// settings.describe successfully. Best effort: returns regardless.
-fn wait_settings_ready(port: u16, timeout: Duration) {
+fn wait_settings_ready(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while !settings_ready(port) && Instant::now() < deadline {
         thread::sleep(POLL_INTERVAL);
     }
+    settings_ready(port)
 }
 
 /// Pick the port the harness should run on: reuse a live DSH when present,
 /// otherwise the first fixed port that is free, otherwise any free port.
 /// `DSH_DESKTOP_FORCE_PORT` (testing hook) skips probing and forces a spawn.
-fn resolve_target_port() -> (u16, Option<String>) {
+fn resolve_target_port(logs: &LogHub) -> (u16, Option<String>) {
     if let Ok(forced) = std::env::var("DSH_DESKTOP_FORCE_PORT") {
         if let Ok(port) = forced.parse::<u16>() {
+            logs.debug(
+                MODULE_BOOT,
+                KIND_NETWORK,
+                format!("DSH_DESKTOP_FORCE_PORT is set; forcing spawn on {port}"),
+            );
             return (port, None);
         }
     }
     for port in FIXED_PORTS {
-        if let Some(body) = probe_dsh(port) {
-            return (port, Some(body));
+        match probe_dsh(port) {
+            Some(body) => {
+                logs.debug(
+                    MODULE_BOOT,
+                    KIND_NETWORK,
+                    format!("port {port} answered the DSH probe; will reuse it"),
+                );
+                return (port, Some(body));
+            }
+            None => {
+                logs.trace(
+                    MODULE_BOOT,
+                    KIND_NETWORK,
+                    format!("port {port} did not answer the DSH probe"),
+                );
+            }
         }
     }
     for port in FIXED_PORTS {
         if tcp_free(port) {
+            logs.debug(
+                MODULE_BOOT,
+                KIND_NETWORK,
+                format!("fixed port {port} is free; selected for a new harness"),
+            );
             return (port, None);
         }
     }
     if let Ok(listener) = TcpListener::bind(("127.0.0.1", 0)) {
         if let Ok(addr) = listener.local_addr() {
+            logs.warn(
+                MODULE_BOOT,
+                KIND_NETWORK,
+                format!(
+                    "all fixed ports are busy; falling back to ephemeral port {}",
+                    addr.port()
+                ),
+            );
             return (addr.port(), None);
         }
     }
+    logs.error(
+        MODULE_BOOT,
+        KIND_NETWORK,
+        "could not bind any loopback port; falling back to 3080",
+    );
     (3080, None)
 }
 
@@ -274,7 +340,16 @@ fn child_path(app: &AppHandle) -> String {
     entries.join(";")
 }
 
-fn spawn_harness(app: &AppHandle, node: &PathBuf, bin: &PathBuf, runtime_dir: &PathBuf, dsh_home: &PathBuf, port: u16, log_path: &PathBuf) -> std::io::Result<Child> {
+fn spawn_harness(
+    app: &AppHandle,
+    node: &Path,
+    bin: &Path,
+    runtime_dir: &Path,
+    dsh_home: &Path,
+    port: u16,
+    log_path: &Path,
+    logs: &Arc<LogHub>,
+) -> std::io::Result<Child> {
     let node = clean_path(node);
     let bin = clean_path(bin);
     let runtime_dir = clean_path(runtime_dir);
@@ -290,30 +365,72 @@ fn spawn_harness(app: &AppHandle, node: &PathBuf, bin: &PathBuf, runtime_dir: &P
         .env("DSH_HOME", dsh_home)
         .env("PATH", child_path(app))
         .current_dir(&runtime_dir);
-    match std::fs::File::create(log_path) {
-        Ok(mut file) => {
-            // Diagnostics: record exactly what we launch (surfaced in the boot log).
-            let _ = writeln!(
-                file,
-                "dsh-desktop spawn: node={:?} bin={:?} cwd={:?} dsh_home={:?} port={port}",
-                node, bin, runtime_dir, dsh_home
+
+    // The raw dsh-web.log stays human-readable (it is also the boot-failure
+    // tail shown by the splash), while each child output line is mirrored
+    // into the structured log hub below.
+    let raw_file = match std::fs::File::create(log_path) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            logs.warn(
+                MODULE_BOOT,
+                KIND_FILE,
+                format!(
+                    "could not create the raw harness log {}: {error}",
+                    log_path.display()
+                ),
             );
-            cmd.stdout(Stdio::from(file.try_clone()?));
-            cmd.stderr(Stdio::from(file));
-        }
-        Err(_) => {
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::null());
+            None
         }
+    };
+    if raw_file.is_some() {
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
     }
+
+    logs.info(
+        MODULE_BOOT,
+        KIND_PROCESS,
+        format!(
+            "spawn dsh web: node={} bin={} cwd={} dsh_home={} port={} raw_log={}",
+            node.display(),
+            bin.display(),
+            runtime_dir.display(),
+            dsh_home.display(),
+            port,
+            log_path.display()
+        ),
+    );
+
     #[cfg(windows)]
     {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.spawn()
+    let mut child = cmd.spawn()?;
+
+    if let Some(file) = raw_file {
+        let writer = Arc::new(Mutex::new(file));
+        {
+            let mut writer = writer.lock().unwrap();
+            let _ = writeln!(
+                writer,
+                "dsh-desktop spawn: node={:?} bin={:?} cwd={:?} dsh_home={:?} port={port}",
+                node, bin, runtime_dir, dsh_home
+            );
+        }
+        if let Some(stdout) = child.stdout.take() {
+            logging::stream_child_output(stdout, false, writer.clone(), logs.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            logging::stream_child_output(stderr, true, writer, logs.clone());
+        }
+    }
+    Ok(child)
 }
 
-fn log_tail(path: &PathBuf, lines: usize) -> String {
+fn log_tail(path: &Path, lines: usize) -> String {
     let Ok(content) = std::fs::read_to_string(path) else {
         return String::new();
     };
@@ -330,6 +447,31 @@ fn set_boot(app: &AppHandle, state: &AppState, next: BootState) {
     if let Ok(mut current) = state.boot.lock() {
         *current = next.clone();
     }
+
+    let level = match next.stage.as_str() {
+        "failed" => LogLevel::Error,
+        "ready" | "serve" => LogLevel::Info,
+        _ => LogLevel::Debug,
+    };
+    let mut message = format!("boot stage -> {} | {}", next.stage, next.detail);
+    if let Some(error) = next.error.as_deref() {
+        message.push_str(" | error: ");
+        message.push_str(error);
+    }
+    if let Some(url) = next.url.as_deref() {
+        message.push_str(" | url: ");
+        message.push_str(url);
+    }
+    let context = serde_json::json!({
+        "stage": next.stage.clone(),
+        "url": next.url.clone(),
+        "error": next.error.clone(),
+        "logTail": next.log_tail.clone(),
+    });
+    state
+        .logs
+        .log_with(level, MODULE_BOOT, KIND_STATE, message, context);
+
     let _ = app.emit("boot://stage", &next);
 }
 
@@ -345,6 +487,12 @@ fn open_main_window(app: &AppHandle, url: String) {
     // A retry (or a port change) with an existing window navigates it instead.
     if let Some(window) = app.get_webview_window("main") {
         if let Ok(parsed) = url.parse::<tauri::Url>() {
+            let logs = app.state::<AppState>().logs.clone();
+            logs.debug(
+                MODULE_WINDOW,
+                KIND_UI,
+                format!("main window already exists; navigating to {url}"),
+            );
             let _ = window.navigate(parsed);
             let _ = window.show();
             let _ = window.set_focus();
@@ -358,6 +506,12 @@ fn open_main_window(app: &AppHandle, url: String) {
     let parsed = match url.parse::<tauri::Url>() {
         Ok(parsed) => parsed,
         Err(error) => {
+            let logs = app.state::<AppState>().logs.clone();
+            logs.error(
+                MODULE_BOOT,
+                KIND_DIAGNOSTIC,
+                format!("invalid harness URL {url:?}: {error}"),
+            );
             eprintln!("dsh-desktop: invalid harness URL: {error}");
             return;
         }
@@ -379,6 +533,12 @@ fn open_main_window(app: &AppHandle, url: String) {
             let _ = win.eval(SKIN);
             let _ = win.show();
             let _ = win.set_focus();
+            let logs = handle.state::<AppState>().logs.clone();
+            logs.info(
+                MODULE_WINDOW,
+                KIND_LIFECYCLE,
+                "main window loaded; splash can close",
+            );
             if let Some(splash) = handle.get_webview_window("splash") {
                 let _ = splash.close();
             }
@@ -387,6 +547,12 @@ fn open_main_window(app: &AppHandle, url: String) {
     {
         Ok(window) => window,
         Err(error) => {
+            let logs = app.state::<AppState>().logs.clone();
+            logs.error(
+                MODULE_WINDOW,
+                KIND_DIAGNOSTIC,
+                format!("could not open the main window: {error}"),
+            );
             eprintln!("dsh-desktop: could not open the main window: {error}");
             return;
         }
@@ -395,49 +561,104 @@ fn open_main_window(app: &AppHandle, url: String) {
 }
 
 fn boot_flow(app: AppHandle, state: AppState, generation: u64) {
-    let set = |stage: &str, detail: &str, error: Option<String>, url: Option<String>, log_tail: Option<String>| {
+    let set = |stage: &str,
+               detail: &str,
+               error: Option<String>,
+               url: Option<String>,
+               log_tail: Option<String>| {
         if !generation_current(&state, generation) {
             return;
         }
-        set_boot(&app, &state, BootState {
-            stage: stage.to_string(),
-            detail: detail.to_string(),
-            error,
-            url,
-            log_tail,
-        });
+        set_boot(
+            &app,
+            &state,
+            BootState {
+                stage: stage.to_string(),
+                detail: detail.to_string(),
+                error,
+                url,
+                log_tail,
+            },
+        );
     };
 
+    state.logs.info(
+        MODULE_BOOT,
+        KIND_LIFECYCLE,
+        format!("boot flow started (generation {generation})"),
+    );
     set("probe", "scanning for a live harness", None, None, None);
 
     // Resolve bundled runtime pieces.
-    let resource_root = match app.path().resolve("resources/runtime", tauri::path::BaseDirectory::Resource) {
+    let resource_root = match app
+        .path()
+        .resolve("resources/runtime", tauri::path::BaseDirectory::Resource)
+    {
         Ok(path) if path.join("node.exe").exists() => path,
-        Ok(_) => match app.path().resolve("runtime", tauri::path::BaseDirectory::Resource) {
+        Ok(_) => match app
+            .path()
+            .resolve("runtime", tauri::path::BaseDirectory::Resource)
+        {
             Ok(fallback) => fallback,
             Err(error) => {
-                set("failed", "runtime resources are missing", Some(format!("resource resolution failed: {error}")), None, None);
+                set(
+                    "failed",
+                    "runtime resources are missing",
+                    Some(format!("resource resolution failed: {error}")),
+                    None,
+                    None,
+                );
                 return;
             }
         },
         Err(error) => {
-            set("failed", "runtime resources are missing", Some(format!("resource resolution failed: {error}")), None, None);
+            set(
+                "failed",
+                "runtime resources are missing",
+                Some(format!("resource resolution failed: {error}")),
+                None,
+                None,
+            );
             return;
         }
     };
     let node = resource_root.join("node.exe");
-    let bin = resource_root.join("node_modules").join("@deepseek-ai").join("dsh").join("lib").join("bin.js");
+    let bin = resource_root
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("lib")
+        .join("bin.js");
+    state.logs.debug(
+        MODULE_BOOT,
+        KIND_FILE,
+        format!(
+            "bundled runtime resolved: root={} node={} cli={}",
+            resource_root.display(),
+            node.display(),
+            bin.display()
+        ),
+    );
     if !node.exists() || !bin.exists() {
         set(
             "failed",
             "runtime bundle is incomplete",
-            Some(format!("expected node.exe and the dsh CLI at:\n{}\n{}", node.display(), bin.display())),
+            Some(format!(
+                "expected node.exe and the dsh CLI at:\n{}\n{}",
+                node.display(),
+                bin.display()
+            )),
             None,
             None,
         );
         return;
     }
     let dsh_home = resolve_dsh_home();
+    state.logs.debug(
+        MODULE_BOOT,
+        KIND_STATE,
+        format!("DSH_HOME resolved to {}", dsh_home.display()),
+    );
 
     // Bring the DSH Desktop hot-swap patch layer forward to this harness
     // generation *before* the process composes its tree. After a restart,
@@ -451,40 +672,89 @@ fn boot_flow(app: AppHandle, state: AppState, generation: u64) {
         if let Err(error) =
             refresh_plugin_state_generation(&profile, &mut plugin_state, generation, &bundles)
         {
+            state.logs.warn(
+                MODULE_PLUGIN,
+                KIND_STATE,
+                format!("plugin hot-swap state migration failed: {error}"),
+            );
             eprintln!("dsh-desktop: plugin hot-swap state migration failed: {error}");
         }
     }
 
-    let log_path = match app.path().app_log_dir() {
-        Ok(dir) => {
-            let _ = std::fs::create_dir_all(&dir);
-            dir.join("dsh-web.log")
-        }
-        Err(_) => std::env::temp_dir().join("dsh-desktop-web.log"),
-    };
+    let log_path = app_log_file(&app, "dsh-web.log");
 
-    let (port, reuse_body) = resolve_target_port();
+    let (port, reuse_body) = resolve_target_port(&state.logs);
     let url = format!("http://127.0.0.1:{port}/");
+    state.logs.debug(
+        MODULE_BOOT,
+        KIND_NETWORK,
+        format!(
+            "target port resolved: {port} ({})",
+            if reuse_body.is_some() {
+                "live harness found"
+            } else {
+                "spawning a new harness"
+            }
+        ),
+    );
 
     if reuse_body.is_some() {
-        set("reuse", &format!("harness already live on 127.0.0.1:{port}"), None, Some(url.clone()), None);
+        set(
+            "reuse",
+            &format!("harness already live on 127.0.0.1:{port}"),
+            None,
+            Some(url.clone()),
+            None,
+        );
         // The server may still be composing its plugin tree; a page loaded
         // now would hit failing settings RPCs (stuck 内测声明 dialog). Wait
         // briefly for the settings service before opening the window.
-        wait_settings_ready(port, Duration::from_secs(6));
+        let ready = wait_settings_ready(port, Duration::from_secs(6));
+        state.logs.info(
+            MODULE_BOOT,
+            KIND_NETWORK,
+            format!("reused harness settings service ready={ready} on port {port}"),
+        );
         let _ = open_main_window(&app, url);
         return;
     }
 
-    set("spawn", &format!("booting harness on 127.0.0.1:{port}"), None, None, None);
+    set(
+        "spawn",
+        &format!("booting harness on 127.0.0.1:{port}"),
+        None,
+        None,
+        None,
+    );
 
-    let child = match spawn_harness(&app, &node, &bin, &resource_root, &dsh_home, port, &log_path) {
+    let child = match spawn_harness(
+        &app,
+        &node,
+        &bin,
+        &resource_root,
+        &dsh_home,
+        port,
+        &log_path,
+        &state.logs,
+    ) {
         Ok(child) => child,
         Err(error) => {
-            set("failed", "could not start the harness", Some(error.to_string()), None, None);
+            set(
+                "failed",
+                "could not start the harness",
+                Some(error.to_string()),
+                None,
+                None,
+            );
             return;
         }
     };
+    let child_pid = child.id();
+    state.logs.info(
+        MODULE_HARNESS,
+        KIND_PROCESS,
+        format!("harness child process started (pid {child_pid})"),
+    );
     *state.child.lock().unwrap() = Some(child);
 
     // Guarantee the harness dies with us, even on TerminateProcess.
@@ -493,11 +763,23 @@ fn boot_flow(app: AppHandle, state: AppState, generation: u64) {
         if let Ok(mut guard) = state.job.lock() {
             if let Some(previous) = guard.take() {
                 let _ = unsafe {
-                    windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(previous as *mut std::ffi::c_void))
+                    windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
+                        previous as *mut std::ffi::c_void,
+                    ))
                 };
             }
             if let Some(child) = state.child.lock().unwrap().as_ref() {
-                *guard = assign_to_kill_job(child);
+                let assigned = assign_to_kill_job(child);
+                state.logs.debug(
+                    MODULE_HARNESS,
+                    KIND_PROCESS,
+                    format!(
+                        "kill-on-close job object assigned={} for pid {}",
+                        assigned.is_some(),
+                        child.id()
+                    ),
+                );
+                *guard = assigned;
             }
         }
     }
@@ -505,24 +787,61 @@ fn boot_flow(app: AppHandle, state: AppState, generation: u64) {
     set("wait", "composing plugin tree", None, None, None);
 
     let deadline = Instant::now() + BOOT_TIMEOUT;
+    let mut last_heartbeat = Instant::now();
     loop {
         if !generation_current(&state, generation) {
             return;
+        }
+        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+            state.logs.trace(
+                MODULE_BOOT,
+                KIND_NETWORK,
+                format!(
+                    "still waiting for the harness on 127.0.0.1:{port} ({:.1}s elapsed)",
+                    (Instant::now() + BOOT_TIMEOUT - deadline).as_secs_f32()
+                ),
+            );
+            last_heartbeat = Instant::now();
         }
         if tcp_free(port) {
             // port not bound yet — keep waiting
         } else if let Some(body) = probe_dsh(port) {
             let _ = body;
-            set("serve", "serving the harness UI", None, Some(url.clone()), None);
+            set(
+                "serve",
+                "serving the harness UI",
+                None,
+                Some(url.clone()),
+                None,
+            );
             // Same readiness gate as the reuse path: never open the window
             // against a half-initialized settings service.
-            wait_settings_ready(port, Duration::from_secs(6));
+            let ready = wait_settings_ready(port, Duration::from_secs(6));
+            state.logs.info(
+                MODULE_BOOT,
+                KIND_NETWORK,
+                format!("harness answered on port {port}; settings service ready={ready}"),
+            );
             let _ = open_main_window(&app, url);
             return;
         }
         if Instant::now() > deadline {
             let tail = log_tail(&log_path, 30);
-            set("failed", "harness did not come up in time", Some("the server log tail may explain why".to_string()), None, Some(tail));
+            state.logs.error(
+                MODULE_BOOT,
+                KIND_NETWORK,
+                format!(
+                    "harness did not come up on port {port} in {}s; killing child; log tail:\n{tail}",
+                    BOOT_TIMEOUT.as_secs()
+                ),
+            );
+            set(
+                "failed",
+                "harness did not come up in time",
+                Some("the server log tail may explain why".to_string()),
+                None,
+                Some(tail),
+            );
             kill_child_tree(state.child.lock().unwrap().as_mut().expect("child exists"));
             return;
         }
@@ -535,7 +854,18 @@ fn boot_flow(app: AppHandle, state: AppState, generation: u64) {
             .unwrap_or(false);
         if exited {
             let tail = log_tail(&log_path, 30);
-            set("failed", "the harness process exited during boot", None, None, Some(tail));
+            state.logs.error(
+                MODULE_HARNESS,
+                KIND_PROCESS,
+                format!("harness process exited during boot; log tail:\n{tail}"),
+            );
+            set(
+                "failed",
+                "the harness process exited during boot",
+                None,
+                None,
+                Some(tail),
+            );
             return;
         }
         thread::sleep(POLL_INTERVAL);
@@ -546,6 +876,11 @@ fn start_boot(app: &AppHandle, state: &AppState) {
     // Kill any previous child, bump the generation so stale threads bail.
     if let Ok(mut guard) = state.child.lock() {
         if let Some(mut child) = guard.take() {
+            state.logs.warn(
+                MODULE_HARNESS,
+                KIND_PROCESS,
+                format!("killing previous harness child (pid {})", child.id()),
+            );
             kill_child_tree(&mut child);
         }
     }
@@ -554,11 +889,17 @@ fn start_boot(app: &AppHandle, state: &AppState) {
         *guard += 1;
         *guard
     };
+    state.logs.info(
+        MODULE_BOOT,
+        KIND_LIFECYCLE,
+        format!("boot requested; stale boot threads will use generation {generation} as a barrier"),
+    );
     let app = app.clone();
     let state = AppState {
         boot: state.boot.clone(),
         child: state.child.clone(),
         generation: state.generation.clone(),
+        logs: state.logs.clone(),
         #[cfg(windows)]
         job: state.job.clone(),
     };
@@ -566,11 +907,22 @@ fn start_boot(app: &AppHandle, state: &AppState) {
 }
 
 fn show_main(app: &AppHandle) {
+    let logs = app.state::<AppState>().logs.clone();
     if let Some(window) = app.get_webview_window("main") {
+        logs.debug(
+            MODULE_WINDOW,
+            KIND_UI,
+            "showing the main window from tray/single-instance",
+        );
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     } else if let Some(splash) = app.get_webview_window("splash") {
+        logs.debug(
+            MODULE_WINDOW,
+            KIND_UI,
+            "main window is not ready; showing splash instead",
+        );
         let _ = splash.show();
         let _ = splash.set_focus();
     }
@@ -604,6 +956,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+    let logs = app.state::<AppState>().logs.clone();
+    logs.debug(
+        MODULE_TRAY,
+        KIND_LIFECYCLE,
+        "system tray icon ready (show / quit)",
+    );
     Ok(())
 }
 
@@ -618,17 +976,62 @@ fn boot_state(state: tauri::State<'_, AppState>) -> BootState {
 
 #[tauri::command]
 fn retry_boot(app: AppHandle, state: tauri::State<'_, AppState>) {
+    state
+        .logs
+        .info(MODULE_BOOT, KIND_COMMAND, "retry_boot invoked from the UI");
     start_boot(&app, &state);
 }
 
 #[tauri::command]
-fn reveal_logs(app: AppHandle) {
-    if let Ok(dir) = app.path().app_log_dir() {
-        let _ = Command::new("explorer")
+fn reveal_logs(app: AppHandle, state: tauri::State<'_, AppState>) {
+    let opened = if let Ok(dir) = app.path().app_log_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        Command::new("explorer")
             .arg(&dir)
             .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
+            .spawn()
+            .is_ok()
+    } else {
+        false
+    };
+    state.logs.info(
+        MODULE_LOGGER,
+        KIND_FILE,
+        format!("reveal_logs invoked; explorer spawned={opened}"),
+    );
+}
+
+#[tauri::command]
+fn log_query(query: LogQuery, state: tauri::State<'_, AppState>) -> LogPage {
+    state.logs.query(&query)
+}
+
+#[tauri::command]
+fn log_meta(state: tauri::State<'_, AppState>) -> LogMeta {
+    state.logs.meta()
+}
+
+#[tauri::command]
+fn log_clear(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let cleared = state.logs.clear_ring();
+    state.logs.info(
+        MODULE_LOGGER,
+        KIND_STATE,
+        format!("in-memory ring cleared ({cleared} entries); JSONL file history is untouched"),
+    );
+    Ok(cleared)
+}
+
+#[tauri::command]
+fn log_client(
+    level: String,
+    module: String,
+    message: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let level = logging::parse_level(&level)?;
+    state.logs.record(level, &module, KIND_UI, message, None);
+    Ok(())
 }
 
 #[derive(Clone, Serialize)]
@@ -687,14 +1090,35 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 /// 把拖入的本地文件/目录复制到 `~/.dsh/attachments/`，返回落盘绝对路径。
 /// 路径列表通常来自 Tauri 的 `tauri://drag-drop` 事件。
 #[tauri::command]
-fn stage_attachments(paths: Vec<String>) -> Result<Vec<StagedAttachment>, String> {
+fn stage_attachments(
+    paths: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<StagedAttachment>, String> {
     let dir = resolve_dsh_home().join("attachments");
-    std::fs::create_dir_all(&dir).map_err(|error| format!("create attachments dir: {error}"))?;
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        let message = format!("create attachments dir: {error}");
+        state.logs.error(MODULE_ATTACHMENT, KIND_FILE, &message);
+        message
+    })?;
+    state.logs.debug(
+        MODULE_ATTACHMENT,
+        KIND_IPC,
+        format!(
+            "stage_attachments received {} path(s); staging into {}",
+            paths.len(),
+            dir.display()
+        ),
+    );
 
     let mut staged = Vec::new();
     for raw in paths {
         let src = PathBuf::from(&raw);
         if !src.exists() {
+            state.logs.warn(
+                MODULE_ATTACHMENT,
+                KIND_FILE,
+                format!("skipping missing drop path {raw}"),
+            );
             continue;
         }
         let name = src
@@ -703,23 +1127,48 @@ fn stage_attachments(paths: Vec<String>) -> Result<Vec<StagedAttachment>, String
             .unwrap_or_else(|| "attachment".to_string());
         let dst = unique_destination(&dir, &name);
         if src.is_dir() {
-            copy_dir_recursive(&src, &dst).map_err(|error| format!("copy dir {raw}: {error}"))?;
+            copy_dir_recursive(&src, &dst).map_err(|error| {
+                let message = format!("copy dir {raw}: {error}");
+                state.logs.error(MODULE_ATTACHMENT, KIND_FILE, &message);
+                message
+            })?;
+            let staged_path = clean_path(&dst).display().to_string();
+            state.logs.info(
+                MODULE_ATTACHMENT,
+                KIND_FILE,
+                format!("staged directory {raw} -> {staged_path}"),
+            );
             staged.push(StagedAttachment {
                 original: raw,
-                path: clean_path(&dst).display().to_string(),
+                path: staged_path,
                 name,
                 kind: "directory".to_string(),
             });
         } else if src.is_file() {
-            std::fs::copy(&src, &dst).map_err(|error| format!("copy {raw}: {error}"))?;
+            std::fs::copy(&src, &dst).map_err(|error| {
+                let message = format!("copy {raw}: {error}");
+                state.logs.error(MODULE_ATTACHMENT, KIND_FILE, &message);
+                message
+            })?;
+            let staged_path = clean_path(&dst).display().to_string();
+            state.logs.info(
+                MODULE_ATTACHMENT,
+                KIND_FILE,
+                format!("staged file {raw} -> {staged_path}"),
+            );
             staged.push(StagedAttachment {
                 original: raw,
-                path: clean_path(&dst).display().to_string(),
+                path: staged_path,
                 name,
                 kind: "file".to_string(),
             });
         }
     }
+    state.logs.info(
+        MODULE_ATTACHMENT,
+        KIND_COMMAND,
+        format!("stage_attachments done: {} item(s) staged", staged.len()),
+    );
     Ok(staged)
 }
 
@@ -791,11 +1240,7 @@ fn default_origin() -> String {
 }
 
 fn current_harness_generation(app_state: &tauri::State<'_, AppState>) -> u64 {
-    app_state
-        .generation
-        .lock()
-        .map(|guard| *guard)
-        .unwrap_or(0)
+    app_state.generation.lock().map(|guard| *guard).unwrap_or(0)
 }
 
 /// After a harness restart the boot bundle snapshot no longer contains
@@ -814,10 +1259,7 @@ fn refresh_plugin_state_generation(
     // bundle list keeps using override-only patches; every other managed
     // package must now contribute its full rows from the hot layer.
     for entry in state.plugins.values_mut() {
-        entry.origin = if manifest_bundles
-            .iter()
-            .any(|bundle| bundle == &entry.name)
-        {
+        entry.origin = if manifest_bundles.iter().any(|bundle| bundle == &entry.name) {
             "boot-bundle".to_string()
         } else {
             "hot-layer".to_string()
@@ -893,13 +1335,15 @@ fn read_profile_manifest(home: &PathBuf) -> Option<(String, serde_json::Value)> 
 }
 
 fn read_json(path: &std::path::Path) -> Result<serde_json::Value, String> {
-    let raw = std::fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
     serde_json::from_str(&raw).map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
 fn write_atomic(path: &std::path::Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
     }
     let file_name = path
         .file_name()
@@ -1113,7 +1557,8 @@ fn build_switch_entry(
     let mut bundle_patch = None;
     let mut client = false;
     if let Some(dir) = package_dir(profile, package_name) {
-        let package = read_json(&dir.join("package.json")).unwrap_or_else(|_| serde_json::json!({}));
+        let package =
+            read_json(&dir.join("package.json")).unwrap_or_else(|_| serde_json::json!({}));
         client = package_has_client(&package);
         if let Some((rows, patch_text)) = bundle_patch_rows(&dir, &package)? {
             bundle_patch = package
@@ -1271,7 +1716,9 @@ fn managed_patch_text(state: &PluginSwitchState) -> Result<String, String> {
         body.push_str(yaml.trim_end_matches('\n'));
         body.push_str("\n\n");
     }
-    Ok(format!("{PATCH_MANAGED_BEGIN}\n{body}{PATCH_MANAGED_END}\n"))
+    Ok(format!(
+        "{PATCH_MANAGED_BEGIN}\n{body}{PATCH_MANAGED_END}\n"
+    ))
 }
 
 fn strip_managed_patch_section(text: &str) -> String {
@@ -1304,8 +1751,7 @@ fn write_managed_patch(profile: &PathBuf, state: &PluginSwitchState) -> Result<(
         // A file containing only comments parses as YAML null, not as the
         // top-level patch array DSH requires. Seed an empty list when the
         // managed section would otherwise be the only content.
-        let managed_has_rows =
-            managed.starts_with("- ") || managed.contains("\n- ");
+        let managed_has_rows = managed.starts_with("- ") || managed.contains("\n- ");
         if managed_has_rows {
             managed
         } else {
@@ -1403,7 +1849,10 @@ fn bundled_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
     let resource_root = app
         .path()
         .resolve("resources/runtime", tauri::path::BaseDirectory::Resource)
-        .or_else(|_| app.path().resolve("runtime", tauri::path::BaseDirectory::Resource))
+        .or_else(|_| {
+            app.path()
+                .resolve("runtime", tauri::path::BaseDirectory::Resource)
+        })
         .map_err(|error| error.to_string())?;
     let node = clean_path(&resource_root.join("node.exe"));
     let bin = clean_path(
@@ -1420,9 +1869,19 @@ fn bundled_runtime(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
     Ok((node, bin))
 }
 
-fn run_plugin_command(app: &AppHandle, args: &[String]) -> Result<String, String> {
+fn run_plugin_command(app: &AppHandle, args: &[String], logs: &LogHub) -> Result<String, String> {
     let (node, bin) = bundled_runtime(app)?;
     let home = resolve_dsh_home();
+    let started = Instant::now();
+    let command_line = format!("{} {}", node.display(), args.join(" "));
+    logs.info(
+        MODULE_PLUGIN,
+        KIND_PROCESS,
+        format!(
+            "run dsh plugin command: {command_line} (cwd {})",
+            home.display()
+        ),
+    );
     let mut cmd = Command::new(&node);
     cmd.arg(&bin)
         .args(args)
@@ -1433,9 +1892,62 @@ fn run_plugin_command(app: &AppHandle, args: &[String]) -> Result<String, String
     {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = cmd.output().map_err(|error| error.to_string())?;
+    let output = cmd.output().map_err(|error| {
+        logs.error(
+            MODULE_PLUGIN,
+            KIND_PROCESS,
+            format!(
+                "dsh plugin command failed to launch after {:.1?}: {error}",
+                started.elapsed()
+            ),
+        );
+        error.to_string()
+    })?;
     let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    let elapsed = started.elapsed();
+    let level = if output.status.success() {
+        LogLevel::Info
+    } else {
+        LogLevel::Error
+    };
+    for line in combined.lines().take(500) {
+        if !line.trim().is_empty() {
+            logs.debug(
+                MODULE_PLUGIN,
+                KIND_CHILD_STDOUT,
+                format!("dsh plugin: {line}"),
+            );
+        }
+    }
+    if combined.lines().count() > 500 {
+        logs.debug(
+            MODULE_PLUGIN,
+            KIND_DIAGNOSTIC,
+            format!(
+                "dsh plugin output truncated in the structured log ({} total lines)",
+                combined.lines().count()
+            ),
+        );
+    }
+    let tail = combined
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    logs.log_with(
+        level,
+        MODULE_PLUGIN,
+        KIND_PERFORMANCE,
+        format!(
+            "dsh plugin command finished in {:.1?} (exit {:?}, {} bytes output): {tail}",
+            elapsed,
+            output.status.code(),
+            combined.len(),
+        ),
+        serde_json::json!({ "args": args, "exitCode": output.status.code(), "elapsedMs": elapsed.as_millis() }),
+    );
     if !output.status.success() {
         return Err(combined);
     }
@@ -1463,6 +1975,7 @@ fn run_plugin_action(
     action: &str,
     spec: &str,
     allow_build: &[String],
+    logs: &LogHub,
 ) -> Result<String, String> {
     let mut args = vec![
         "plugin".to_string(),
@@ -1476,7 +1989,12 @@ fn run_plugin_action(
         }
     }
     args.push(spec.to_string());
-    run_plugin_command(app, &args)
+    logs.debug(
+        MODULE_PLUGIN,
+        KIND_COMMAND,
+        format!("plugin {action} {spec} (allow_build={})", allow_build.len()),
+    );
+    run_plugin_command(app, &args, logs)
 }
 
 /// Turn a pasted GitHub URL into the pnpm shorthand `github:owner/repo`.
@@ -1488,7 +2006,8 @@ fn normalize_plugin_spec(input: &str) -> String {
     }
 
     let github_path = |text: &str| -> Option<String> {
-        let text = text.trim_start_matches("https://")
+        let text = text
+            .trim_start_matches("https://")
             .trim_start_matches("http://")
             .trim_start_matches("git+")
             .trim_start_matches("www.")
@@ -1516,7 +2035,9 @@ fn normalize_plugin_spec(input: &str) -> String {
         if repo.is_empty() {
             return None;
         }
-        let branch = tree_branch.filter(|branch| !branch.is_empty()).or_else(|| fragment.filter(|branch| !branch.is_empty()));
+        let branch = tree_branch
+            .filter(|branch| !branch.is_empty())
+            .or_else(|| fragment.filter(|branch| !branch.is_empty()));
         Some(match branch {
             Some(branch) => format!("{owner}/{repo}#{branch}"),
             None => format!("{owner}/{repo}"),
@@ -1595,7 +2116,9 @@ fn plugin_list(app: AppHandle, app_state: tauri::State<'_, AppState>) -> PluginL
                             collect_rows_by_name(row, name, &mut matches);
                         }
                         match matches.last() {
-                            Some(row) => row.get("disabled").and_then(|d| d.as_bool()) != Some(true),
+                            Some(row) => {
+                                row.get("disabled").and_then(|d| d.as_bool()) != Some(true)
+                            }
                             None => bundles.iter().any(|bundle| bundle == name),
                         }
                     };
@@ -1609,7 +2132,11 @@ fn plugin_list(app: AppHandle, app_state: tauri::State<'_, AppState>) -> PluginL
                         .and_then(|dir| read_json(&dir.join("package.json")).ok())
                         .map(|package| package_has_client(&package))
                         .unwrap_or_else(|| {
-                            state.plugins.get(name).map(|entry| entry.client).unwrap_or(false)
+                            state
+                                .plugins
+                                .get(name)
+                                .map(|entry| entry.client)
+                                .unwrap_or(false)
                         });
                     PluginDependency {
                         name: name.clone(),
@@ -1625,13 +2152,24 @@ fn plugin_list(app: AppHandle, app_state: tauri::State<'_, AppState>) -> PluginL
     let pnpm = tools_dir(&app)
         .map(|dir| dir.join("pnpm.exe").exists() || dir.join("pnpm").join("pnpm.exe").exists())
         .unwrap_or(false);
-    PluginList {
+    let result = PluginList {
         home: home.display().to_string(),
         profile: profile_path,
-        bundles,
+        bundles: bundles.clone(),
         dependencies,
         pnpm,
-    }
+    };
+    app_state.logs.debug(
+        MODULE_PLUGIN,
+        KIND_IPC,
+        format!(
+            "plugin_list served: {} bundle(s), {} dependency(ies), pnpm={}",
+            result.bundles.len(),
+            result.dependencies.len(),
+            pnpm
+        ),
+    );
+    result
 }
 
 /// Hot-enable/disable an installed plugin by rewriting the DSH Desktop
@@ -1645,8 +2183,18 @@ fn plugin_set_enabled(
 ) -> Result<PluginToggleResult, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
+        app_state.logs.warn(
+            MODULE_PLUGIN,
+            KIND_COMMAND,
+            "plugin_set_enabled rejected: empty name",
+        );
         return Err("plugin name is empty".to_string());
     }
+    app_state.logs.info(
+        MODULE_PLUGIN,
+        KIND_COMMAND,
+        format!("plugin_set_enabled: {name} -> {enabled}"),
+    );
     let home = resolve_dsh_home();
     let profile = profile_dir(&home);
     let mut state = load_plugin_state(&profile);
@@ -1660,6 +2208,11 @@ fn plugin_set_enabled(
         .map(|deps| deps.contains_key(&name))
         .unwrap_or(false);
     if !is_installed {
+        app_state.logs.warn(
+            MODULE_PLUGIN,
+            KIND_STATE,
+            format!("plugin_set_enabled rejected: {name} is not in the web profile manifest"),
+        );
         return Err(format!("{name} is not installed in the web profile"));
     }
     let bundles = manifest_bundle_names(&manifest);
@@ -1680,6 +2233,14 @@ fn plugin_set_enabled(
     save_plugin_state(&profile, &state)?;
     write_managed_patch(&profile, &state)?;
     remove_state_plugins_from_bundles(&profile, &state)?;
+    app_state.logs.info(
+        MODULE_PLUGIN,
+        KIND_STATE,
+        format!(
+            "plugin {name} {}; managed patch rewritten and handed to cordis HMR",
+            if enabled { "enabled" } else { "disabled" }
+        ),
+    );
     Ok(PluginToggleResult {
         message: format!(
             "[dsh-desktop] {name} {} — cordis HMR is applying the patch layer now",
@@ -1699,12 +2260,27 @@ fn plugin_manage(
     app_state: tauri::State<'_, AppState>,
 ) -> Result<PluginManageResult, String> {
     if action != "add" && action != "remove" {
+        app_state.logs.warn(
+            MODULE_PLUGIN,
+            KIND_COMMAND,
+            format!("plugin_manage rejected: unknown action {action:?}"),
+        );
         return Err(format!("unknown plugin action {action:?}"));
     }
     let raw = name.trim().to_string();
     if raw.is_empty() {
+        app_state.logs.warn(
+            MODULE_PLUGIN,
+            KIND_COMMAND,
+            "plugin_manage rejected: empty spec",
+        );
         return Err("plugin spec is empty".to_string());
     }
+    app_state.logs.info(
+        MODULE_PLUGIN,
+        KIND_COMMAND,
+        format!("plugin_manage: {action} {raw}"),
+    );
     let spec = if action == "add" {
         normalize_plugin_spec(&raw)
     } else {
@@ -1749,7 +2325,8 @@ fn plugin_manage(
     }
 
     let no_build_keys = Vec::new();
-    let mut output = match run_plugin_action(&app, &action, &spec, &no_build_keys) {
+    let mut output = match run_plugin_action(&app, &action, &spec, &no_build_keys, &app_state.logs)
+    {
         Ok(output) => output,
         Err(first_error) if action == "add" => {
             // pnpm 10+ blocks git-hosted build scripts until approved. Retry
@@ -1757,13 +2334,26 @@ fn plugin_manage(
             // like "paste a GitHub URL and install".
             let build_keys = ignored_build_keys(&first_error);
             if !build_keys.is_empty() {
-                run_plugin_action(&app, &action, &spec, &build_keys)?
+                app_state.logs.warn(
+                    MODULE_PLUGIN,
+                    KIND_PROCESS,
+                    format!(
+                        "pnpm blocked git build scripts; retrying with {} allow-build key(s)",
+                        build_keys.len()
+                    ),
+                );
+                run_plugin_action(&app, &action, &spec, &build_keys, &app_state.logs)?
             } else if first_error.contains("EPERM") && first_error.contains("package.json") {
                 // The running harness can briefly hold the profile manifest
                 // on Windows. pnpm usually already installed the dependency
                 // when this happens; a single delayed retry reconciles it.
+                app_state.logs.warn(
+                    MODULE_PLUGIN,
+                    KIND_FILE,
+                    "manifest EPERM race detected; retrying once after 450ms",
+                );
                 thread::sleep(Duration::from_millis(450));
-                run_plugin_action(&app, &action, &spec, &no_build_keys)?
+                run_plugin_action(&app, &action, &spec, &no_build_keys, &app_state.logs)?
             } else {
                 return Err(first_error);
             }
@@ -1803,7 +2393,8 @@ fn plugin_manage(
                     .get(package_name)
                     .map(|entry| entry.origin.clone())
                     .unwrap_or_else(|| "hot-layer".to_string());
-                let mut entry = ensure_switch_entry(&profile, package_name, &mut state, &previous_origin)?;
+                let mut entry =
+                    ensure_switch_entry(&profile, package_name, &mut state, &previous_origin)?;
                 entry.name = package_name.clone();
                 entry.origin = previous_origin;
                 entry.enabled = true;
@@ -1826,20 +2417,36 @@ fn plugin_manage(
         }
     }
 
-    Ok(PluginManageResult {
+    let result = PluginManageResult {
         reload: !client_changes.is_empty(),
         clients: client_changes,
         output,
-    })
+    };
+    app_state.logs.info(
+        MODULE_PLUGIN,
+        KIND_STATE,
+        format!(
+            "plugin_manage {action} {raw} complete: {} client(s) need reload, output {} bytes",
+            result.clients.len(),
+            result.output.len()
+        ),
+    );
+    Ok(result)
 }
 
 /// Best-effort mapping for plain package specs when an add operation did not
 /// create a new manifest key (for example `pnpm add <name>@latest`).
 fn spec_name_for_existing(spec: &str) -> Option<String> {
-    if let Some(path) = spec.strip_prefix("file:").or_else(|| spec.strip_prefix("link:")) {
+    if let Some(path) = spec
+        .strip_prefix("file:")
+        .or_else(|| spec.strip_prefix("link:"))
+    {
         let path = std::path::Path::new(path);
         let package = read_json(&path.join("package.json")).ok()?;
-        return package.get("name").and_then(|name| name.as_str()).map(String::from);
+        return package
+            .get("name")
+            .and_then(|name| name.as_str())
+            .map(String::from);
     }
     if spec.starts_with('@') && spec.contains('/') {
         // @scope/name or @scope/name@version. The scope separator is the
@@ -2173,7 +2780,10 @@ pub fn run() {
     {
         // Allow CDP inspection of the WebView2 for design verification.
         if std::env::var_os("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").is_none() {
-            std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--remote-debugging-port=9333");
+            std::env::set_var(
+                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                "--remote-debugging-port=9333",
+            );
         }
     }
 
@@ -2182,11 +2792,48 @@ pub fn run() {
             show_main(app);
         }))
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![boot_state, retry_boot, reveal_logs, stage_attachments, plugin_list, plugin_manage, plugin_set_enabled, mcp_list, mcp_set_enabled])
+        .invoke_handler(tauri::generate_handler![
+            boot_state,
+            retry_boot,
+            reveal_logs,
+            stage_attachments,
+            plugin_list,
+            plugin_manage,
+            plugin_set_enabled,
+            mcp_list,
+            mcp_set_enabled,
+            log_query,
+            log_meta,
+            log_clear,
+            log_client
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
-            build_tray(&handle)?;
             let state: tauri::State<'_, AppState> = app.state();
+
+            // Structured log hub: attach the JSONL file + event emitter before
+            // anything else so even tray/boot setup is captured.
+            let log_file = app_log_file(&handle, "dsh-desktop.log");
+            if let Err(error) = state.logs.attach(&log_file) {
+                eprintln!("dsh-desktop: could not open structured log file: {error}");
+            }
+            {
+                let emitter_handle = handle.clone();
+                state.logs.set_emitter(Arc::new(move |entry| {
+                    let _ = emitter_handle.emit(logging::EVENT_LOG_ENTRY, entry);
+                }));
+            }
+            state.logs.info(
+                MODULE_APP,
+                KIND_LIFECYCLE,
+                format!(
+                    "DSH Desktop starting (version {}, log file {})",
+                    app.package_info().version,
+                    log_file.display()
+                ),
+            );
+
+            build_tray(&handle)?;
             start_boot(&handle, &state);
             Ok(())
         })
@@ -2194,6 +2841,12 @@ pub fn run() {
             if window.label() == "main" {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     // Closing hides to tray; the agent keeps working.
+                    let logs = window.app_handle().state::<AppState>().logs.clone();
+                    logs.info(
+                        MODULE_WINDOW,
+                        KIND_UI,
+                        "main window close requested; hiding to tray instead of quitting",
+                    );
                     api.prevent_close();
                     let _ = window.hide();
                 }
@@ -2204,8 +2857,14 @@ pub fn run() {
 
     app.run(|app_handle, event| match event {
         RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+            let state = app_handle.state::<AppState>();
+            state.logs.info(
+                MODULE_APP,
+                KIND_LIFECYCLE,
+                "exit requested; tearing the harness process tree down",
+            );
             let child = {
-                let child_arc = app_handle.state::<AppState>().child.clone();
+                let child_arc = state.child.clone();
                 let taken = match child_arc.lock() {
                     Ok(mut guard) => guard.take(),
                     Err(_) => None,
@@ -2391,9 +3050,10 @@ mod tests {
         assert!(rows.iter().any(|row| row["id"] == "pwsh-sandbox"));
         assert!(rows.iter().any(|row| row["insert"][0]["id"] == "demo"));
 
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(profile.join("package.json")).expect("manifest"))
-                .expect("manifest parses");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(profile.join("package.json")).expect("manifest"),
+        )
+        .expect("manifest parses");
         let bundles = manifest_bundle_names(&manifest);
         assert_eq!(bundles, vec!["@deepseek-ai/dsh-base".to_string()]);
 

@@ -1,7 +1,10 @@
 {
   "identifier": "desktop",
   "description": "DSH Desktop windows: the splash shell and the remote harness UI on fixed loopback ports.",
-  "windows": ["splash", "main"],
+  "windows": [
+    "splash",
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",
@@ -24,7 +27,11 @@
     "allow-plugin-manage",
     "allow-plugin-set-enabled",
     "allow-mcp-list",
-    "allow-mcp-set-enabled"
+    "allow-mcp-set-enabled",
+    "allow-log-query",
+    "allow-log-meta",
+    "allow-log-clear",
+    "allow-log-client"
   ],
   "remote": {
     "urls": [
